@@ -22,6 +22,10 @@ It must pass completely. It verifies:
 - Run metadata excludes task text and secret-like result content.
 - Real workspace changes stop automatic retry and Provider fallback.
 - Native canaries remain evidence-only and must never promote a production route automatically.
+- Automatic routing and native canary telemetry are separate: compare `by_run_type.external_run` with
+  `native_v1_canary`, `native_smoke_test`, or `cliproxy_native_canary`; never combine their success rates.
+- Circuit state is tested across process boundaries through its private state file, including TTL expiry,
+  explicit-provider bypass, and fail-open behavior on persistence errors.
 
 GitHub Actions runs this same command on every pull request and push to `main`. It has read-only repository permissions and receives no Provider credentials.
 
@@ -70,7 +74,7 @@ Its report contains aggregates only. A nonzero exit means at least one run did n
 
 For a concurrency experiment, keep write tasks pointed at one workdir and verify all but one return `blocked`; use separate disposable workdirs for read-only parallelism. Record the exact concurrency level, start method, status counts, p50/p95 duration, stream failure reasons, fallback count, and partial-write count. Do not publish a concurrency guarantee beyond the highest fully observed level.
 
-Record only: timestamp, Worker version, role, provider route, status, duration, stream finish
+Record only: timestamp, Worker version, run type, role, provider route, status, duration, stream finish
 reason, retry/fallback flags, and redacted aggregate usage. Do not publish prompts, workspace paths,
 request bodies, response bodies, thread ids, credentials, or raw logs.
 

@@ -25,13 +25,15 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = ROOT / "schemas/result.schema.json"
 CODEX_HOME = Path.home() / ".codex"
 CONFIG_PATH = CODEX_HOME / "config.toml"
 RUN_LOG_PATH = CODEX_HOME / "deepseek-worker-runs.jsonl"
+CIRCUIT_STATE_PATH = CODEX_HOME / "deepseek-worker-circuit.json"
+CIRCUIT_LOCK_PATH = CODEX_HOME / "deepseek-worker-circuit.lock"
 JOB_ROOT = CODEX_HOME / "deepseek-worker-jobs"
 MAX_FALLBACK_SNAPSHOT_FILES = 10000
 DEFAULT_CATALOG_PATH = CODEX_HOME / "deepseek-subagent-model-catalog.json"
@@ -80,6 +82,130 @@ TERRA_ROLES = {"review", "validation", "second-opinion"}
 
 class WorkerError(RuntimeError):
     pass
+
+
+CIRCUIT_FAILURE_THRESHOLD = 2
+CIRCUIT_TTL_SECONDS = 30
+
+
+def _circuit_lock():
+    CIRCUIT_LOCK_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = CIRCUIT_LOCK_PATH.open("a+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def _read_circuit_state() -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(CIRCUIT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    state: dict[str, dict[str, Any]] = {}
+    for provider, item in raw.items():
+        if provider not in PROVIDERS or not isinstance(item, dict):
+            continue
+        try:
+            failures = max(0, int(item.get("failures", 0)))
+            tripped_until = max(0.0, float(item.get("tripped_until", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        state[provider] = {"failures": failures, "tripped_until": tripped_until}
+    return state
+
+
+def _write_circuit_state(state: dict[str, dict[str, Any]]) -> bool:
+    temporary: Path | None = None
+    try:
+        CIRCUIT_STATE_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=CIRCUIT_STATE_PATH.parent, prefix=".worker-circuit-", delete=False) as handle:
+            json.dump(state, handle, separators=(",", ":"))
+            handle.write("\n")
+            temporary = Path(handle.name)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, CIRCUIT_STATE_PATH)
+        return True
+    except OSError:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
+def _with_circuit_state(update) -> dict[str, dict[str, Any]]:
+    """Read/update circuit state; any persistence failure is deliberately fail-open."""
+    try:
+        handle = _circuit_lock()
+    except OSError:
+        return {}
+    try:
+        state = _read_circuit_state()
+        update(state)
+        return state if _write_circuit_state(state) else None
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def circuit_open(provider: str) -> bool:
+    now = time.time()
+    result = {"open": False}
+
+    def update(state: dict[str, dict[str, Any]]) -> None:
+        item = state.get(provider)
+        if item and item["tripped_until"] > now:
+            result["open"] = True
+        elif item:
+            state.pop(provider, None)
+
+    persisted = _with_circuit_state(update)
+    if persisted is None:
+        return False
+    return bool(result["open"])
+
+
+def circuit_failure(provider: str) -> None:
+    now = time.time()
+
+    def update(state: dict[str, dict[str, Any]]) -> None:
+        item = state.setdefault(provider, {"failures": 0, "tripped_until": 0.0})
+        item["failures"] += 1
+        if item["failures"] >= CIRCUIT_FAILURE_THRESHOLD:
+            item["tripped_until"] = now + CIRCUIT_TTL_SECONDS
+
+    _with_circuit_state(update)
+
+
+def circuit_success(provider: str) -> None:
+    _with_circuit_state(lambda state: state.pop(provider, None))
+
+
+def circuit_summary() -> dict[str, dict[str, Any]]:
+    now = time.time()
+    result: dict[str, dict[str, Any]] = {}
+
+    def update(state: dict[str, dict[str, Any]]) -> None:
+        for provider, item in list(state.items()):
+            if item["tripped_until"] <= now:
+                state.pop(provider, None)
+                continue
+            result[provider] = {
+                "failures": item["failures"],
+                "remaining_seconds": round(item["tripped_until"] - now, 1),
+            }
+
+    _with_circuit_state(update)
+    return result
+
+
+def circuit_reset() -> None:
+    def update(state: dict[str, dict[str, Any]]) -> None:
+        state.clear()
+
+    _with_circuit_state(update)
 
 
 def emit(payload: dict[str, Any], as_json: bool) -> None:
@@ -147,8 +273,8 @@ def route(role: str, task: str = "") -> dict[str, Any]:
         return {
             "target": "deepseek",
             "role": normalized,
-            "provider": "sensenova",
-            "profile": PROVIDERS["sensenova"]["profile"],
+            "provider": "sensenova1",
+            "profile": PROVIDERS["sensenova1"]["profile"],
             "sandbox": "read-only",
             "reason": "read_heavy_execution",
         }
@@ -263,7 +389,7 @@ def build_provider_order(role: str, selected_provider: str, automatic: bool) -> 
         return [selected_provider]
     normalized = normalize_role(role)
     if normalized in READ_ONLY_ROLES:
-        preferred = ("sensenova", "sensenova1")
+        preferred = ("sensenova1", "sensenova")
     elif normalized in WORKER_ROLES:
         preferred = ("sensenova1", "sensenova")
     else:
@@ -966,9 +1092,10 @@ def invoke_codex(
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
-def record_run(payload: dict[str, Any]) -> None:
+def record_run(payload: dict[str, Any], run_type: str = "external_run") -> None:
     record = {
         "timestamp": datetime.now(UTC).isoformat(),
+        "run_type": run_type,
         "status": payload.get("status"),
         "provider": payload.get("provider"),
         "role": payload.get("role"),
@@ -1124,7 +1251,26 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     selected_provider = args.provider if args.provider != "auto" else decision["provider"]
     if selected_provider not in PROVIDERS:
         raise WorkerError(f"unknown provider: {selected_provider}")
-    provider_order = build_provider_order(decision["role"], selected_provider, args.provider == "auto")
+    automatic = args.provider == "auto"
+    provider_order = build_provider_order(decision["role"], selected_provider, automatic)
+    if automatic:
+        provider_order = [provider for provider in provider_order if not circuit_open(provider)]
+        if not provider_order:
+            payload = {
+                "status": "error",
+                "provider": selected_provider,
+                "profile": PROVIDERS[selected_provider]["profile"],
+                "role": decision["role"],
+                "summary": "All automatic DeepSeek providers are temporarily circuit-open.",
+                "files_changed": [],
+                "tests": [],
+                "risks": ["provider circuit state is fail-open when its state file cannot be read or written"],
+                "usage": {},
+                "duration_seconds": 0.0,
+            }
+            if not args.no_record:
+                record_run(payload, run_type="external_run")
+            return payload
     sandbox = args.sandbox if args.sandbox != "auto" else decision["sandbox"]
     lock_handle = None
     if sandbox == "workspace-write":
@@ -1144,7 +1290,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 "duration_seconds": 0.0,
             }
             if not args.no_record:
-                record_run(payload)
+                record_run(payload, run_type="external_run")
             return payload
     try:
         return _run_worker_locked(args, task, workdir, decision, selected_provider, provider_order, sandbox)
@@ -1163,6 +1309,7 @@ def _run_worker_locked(
     provider_order: list[str],
     sandbox: str,
 ) -> dict[str, Any]:
+    automatic = args.provider == "auto"
     before = workspace_snapshot(workdir)
     current_snapshot = before
     started = time.monotonic()
@@ -1248,6 +1395,8 @@ def _run_worker_locked(
             if attempt_changes:
                 side_effect_attempt = {"provider": provider, "files_changed": attempt_changes}
                 break
+            if automatic:
+                circuit_failure(provider)
             retry_budget = int(provider_deadline - time.monotonic())
             if stream["failure"] is not None and stream_retry_count == 0 and retry_budget >= 5:
                 stream_retry_count += 1
@@ -1314,8 +1463,10 @@ def _run_worker_locked(
             "stream_retry_count": 1 if used_stream_retry else 0,
             "timeout_seconds": total_timeout,
         }
+    if automatic and accepted:
+        circuit_success(provider)
     if not args.no_record:
-        record_run(payload)
+        record_run(payload, run_type="external_run")
     return payload
 
 
@@ -1901,13 +2052,20 @@ def stats(hours: float) -> dict[str, Any]:
     successes = sum(1 for row in rows if row.get("status") == "success")
     status_counts: dict[str, int] = {}
     by_provider: dict[str, int] = {}
+    by_run_type: dict[str, dict[str, Any]] = {}
     provider_stats: dict[str, dict[str, Any]] = {}
     total_input = total_cached = total_cache_write = total_output = total_reasoning = 0
     for row in rows:
         status = str(row.get("status", "unknown"))
+        run_type = str(row.get("run_type", "external_run"))
         status_counts[status] = status_counts.get(status, 0) + 1
         provider = str(row.get("provider", "unknown"))
         by_provider[provider] = by_provider.get(provider, 0) + 1
+        run_detail = by_run_type.setdefault(run_type, {"runs": 0, "successes": 0, "status_counts": {}})
+        run_detail["runs"] += 1
+        if status == "success":
+            run_detail["successes"] += 1
+        run_detail["status_counts"][status] = run_detail["status_counts"].get(status, 0) + 1
         usage = row.get("usage") or {}
         input_tokens = int(usage.get("input_tokens", 0))
         cached_input_tokens = int(usage.get("cached_input_tokens", 0))
@@ -1941,8 +2099,10 @@ def stats(hours: float) -> dict[str, Any]:
         "successes": successes,
         "success_rate_percent": round(100 * successes / len(rows), 2) if rows else 0.0,
         "by_provider": by_provider,
+        "by_run_type": by_run_type,
         "status_counts": status_counts,
         "provider_stats": provider_stats,
+        "circuit": circuit_summary(),
         "usage": {
             "input_tokens": total_input,
             "cached_input_tokens": total_cached,
@@ -2045,16 +2205,19 @@ def main() -> int:
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = native_smoke(args.agent, workdir, args.timeout)
+            record_run(payload, run_type="native_smoke_test")
         elif args.command == "native-v1-canary":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = native_v1_canary(args.provider, workdir, args.timeout, args.parent_model)
+            record_run(payload, run_type="native_v1_canary")
         elif args.command == "cliproxy-native-canary":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = cliproxy_native_canary(workdir, args.timeout, args.parent_model)
+            record_run(payload, run_type="cliproxy_native_canary")
         elif args.command == "route":
             payload = {"status": "success", **route(args.role, args.task)}
         elif args.command == "run":

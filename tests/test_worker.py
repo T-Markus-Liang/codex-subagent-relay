@@ -97,7 +97,7 @@ class RouterTests(unittest.TestCase):
 
     def test_explorer_route(self):
         result = module.route("repository-exploration")
-        self.assertEqual(result["provider"], "sensenova")
+        self.assertEqual(result["provider"], "sensenova1")
         self.assertEqual(result["sandbox"], "read-only")
 
     def test_worker_route(self):
@@ -155,13 +155,32 @@ class RouterTests(unittest.TestCase):
 
     def test_auto_provider_order_is_role_specific(self):
         self.assertEqual(
-            module.build_provider_order("repository-exploration", "sensenova", True),
-            ["sensenova", "sensenova1"],
+            module.build_provider_order("repository-exploration", "sensenova1", True),
+            ["sensenova1", "sensenova"],
         )
         self.assertEqual(
             module.build_provider_order("implementation", "sensenova1", True),
             ["sensenova1", "sensenova"],
         )
+
+    def test_circuit_breaker_persists_across_calls_and_explicit_provider_bypasses(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            with patch.object(module, "CODEX_HOME", Path(temporary_dir)), \
+                 patch.object(module, "CIRCUIT_STATE_PATH", Path(temporary_dir) / "circuit.json"), \
+                 patch.object(module, "CIRCUIT_LOCK_PATH", Path(temporary_dir) / "circuit.lock"), \
+                 patch.object(module, "time") as clock:
+                clock.time.return_value = 100.0
+                module.circuit_failure("sensenova")
+                module.circuit_failure("sensenova")
+                self.assertTrue(module.circuit_open("sensenova"))
+                self.assertEqual(module.build_provider_order("repository-exploration", "sensenova", False), ["sensenova"])
+                clock.time.return_value = 131.0
+                self.assertFalse(module.circuit_open("sensenova"))
+                module.circuit_success("sensenova1")
+
+    def test_circuit_state_read_write_failure_is_fail_open(self):
+        with patch.object(module, "CIRCUIT_LOCK_PATH", Path("/definitely/missing/circuit.lock")):
+            self.assertFalse(module.circuit_open("sensenova"))
 
     def test_first_provider_gets_most_timeout_budget(self):
         self.assertEqual(module.provider_timeouts(75, 2), [55, 20])
@@ -194,15 +213,17 @@ class RouterTests(unittest.TestCase):
             log = Path(temporary_dir) / "runs.jsonl"
             base_time = module.datetime.now(module.UTC).replace(microsecond=0)
             log.write_text("\n".join([
-                json.dumps({"timestamp": base_time.isoformat(), "status": "success", "provider": "sensenova", "duration_seconds": 10, "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
-                json.dumps({"timestamp": (base_time - module.timedelta(minutes=1)).isoformat(), "status": "partial", "provider": "sensenova1", "duration_seconds": 20, "usage": {"input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 2}}),
-                json.dumps({"timestamp": (base_time - module.timedelta(minutes=2)).isoformat(), "status": "error", "provider": "sensenova1", "duration_seconds": 30, "usage": {"input_tokens": 30, "cached_input_tokens": 6, "output_tokens": 5, "reasoning_output_tokens": 3}}),
+                json.dumps({"timestamp": base_time.isoformat(), "run_type": "external_run", "status": "success", "provider": "sensenova", "duration_seconds": 10, "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
+                json.dumps({"timestamp": (base_time - module.timedelta(minutes=1)).isoformat(), "run_type": "native_v1_canary", "status": "partial", "provider": "sensenova1", "duration_seconds": 20, "usage": {"input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 2}}),
+                json.dumps({"timestamp": (base_time - module.timedelta(minutes=2)).isoformat(), "run_type": "external_run", "status": "error", "provider": "sensenova1", "duration_seconds": 30, "usage": {"input_tokens": 30, "cached_input_tokens": 6, "output_tokens": 5, "reasoning_output_tokens": 3}}),
             ]) + "\n")
             with patch.object(module, "RUN_LOG_PATH", log):
                 payload = module.stats(2)
         self.assertEqual(payload["status_counts"], {"success": 1, "partial": 1, "error": 1})
         self.assertEqual(payload["usage"]["cached_input_tokens"], 15)
         self.assertEqual(payload["provider_stats"]["sensenova1"]["success_rate_percent"], 0.0)
+        self.assertEqual(payload["by_run_type"]["external_run"]["runs"], 2)
+        self.assertEqual(payload["by_run_type"]["native_v1_canary"]["runs"], 1)
 
     def test_catalog_default_is_not_global_config(self):
         self.assertNotEqual(module.DEFAULT_CATALOG_PATH, module.CONFIG_PATH)
@@ -526,7 +547,7 @@ class RouterTests(unittest.TestCase):
             )
         )
         results = [module.subprocess.CompletedProcess([], 0, invalid, ""), module.subprocess.CompletedProcess([], 0, valid, "")]
-        with tempfile.TemporaryDirectory() as workdir:
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as circuit_dir:
             args = SimpleNamespace(
                 task="inspect files",
                 task_file=None,
@@ -537,11 +558,13 @@ class RouterTests(unittest.TestCase):
                 timeout=90,
                 no_record=True,
             )
-            with patch.object(module, "invoke_codex", side_effect=results) as invoke:
+            with patch.object(module, "invoke_codex", side_effect=results) as invoke, \
+                 patch.object(module, "CIRCUIT_STATE_PATH", Path(circuit_dir) / "circuit.json"), \
+                 patch.object(module, "CIRCUIT_LOCK_PATH", Path(circuit_dir) / "circuit.lock"):
                 payload = module.run_worker(args)
         self.assertEqual(invoke.call_count, 2)
-        self.assertIn("sensenova1/deepseek-v4-flash", invoke.call_args_list[1].args[0])
-        self.assertEqual(payload["provider"], "sensenova1")
+        self.assertIn("sensenova/deepseek-v4-flash", invoke.call_args_list[1].args[0])
+        self.assertEqual(payload["provider"], "sensenova")
         self.assertIn("provider fallback was used after an earlier DeepSeek route failed", payload["risks"])
 
     def test_length_finish_retries_same_provider_once_with_output_limit(self):

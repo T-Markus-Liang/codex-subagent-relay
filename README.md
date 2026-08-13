@@ -13,7 +13,7 @@ It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, Ope
 
 ## What It Does
 
-- Routes read-heavy work to one configured third-party route and write-heavy work to another.
+- Routes read-heavy work to `sensenova1` first and falls back to `sensenova`; write-heavy work uses the same order.
 - Requires real tool activity, a healthy terminal stream, a strict five-field JSON result, and a matching workspace diff before accepting a result.
 - Retries a stream failure once, then uses bounded Provider fallback only when the workspace is unchanged.
 - Stops on a partial write rather than replaying the task with another Provider.
@@ -95,13 +95,15 @@ The relay adds bounded metadata such as Provider, duration, usage, and stream re
 
 | Role family | Default Provider order | Sandbox | Default budget |
 | --- | --- | --- | --- |
-| `search`, `repository-exploration`, `logs` | `sensenova -> sensenova1` | read-only | 75 seconds |
+| `search`, `repository-exploration`, `logs` | `sensenova1 -> sensenova` | read-only | 75 seconds |
 | `implementation`, `test`, `debug`, `refactor`, `docs` | `sensenova1 -> sensenova` | workspace-write | 120 seconds |
 | architecture, planning, final review | kept by the caller | n/a | n/a |
 
 `opencode-go` is available only with an explicit `--provider` for diagnostics; it is not part of automatic production fallback. The Worker serializes concurrent write tasks per workdir. A write that changes files but fails the result contract returns `partial` and stops all retry/fallback. Review that diff manually.
 
-Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`.
+Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
+
+Automatic routing maintains a short-lived per-Provider circuit in `~/.codex/deepseek-worker-circuit.json`. Two no-side-effect failures temporarily skip a Provider for 30 seconds, allowing the other route to run without spending its full timeout. Explicit `--provider` diagnostics bypass this state. State persistence is fail-open: an unreadable or unwritable circuit file never blocks a task. Any workspace side effect still stops retry and fallback.
 
 ## Status
 

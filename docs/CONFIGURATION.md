@@ -39,7 +39,7 @@ DEEPSEEK_WORKER_OPENCODE_PATH=/absolute/path/to/opencode deepseek-worker --json 
 
 `healthy` means Codex is available, OpenCode is executable, the root Provider is `openai-chatgpt`, expected profiles identify the expected model, health URLs respond, and the candidate native model catalog can be read.
 
-`healthy` is not a live task success guarantee. Before real work, run one disposable read-only smoke against each route you plan to use:
+`healthy` is not a live task success guarantee. Before real work, run one disposable read-only smoke against each route you plan to use. Automatic read routing starts with `sensenova1`, then falls back to `sensenova`; `opencode-go` remains explicit-diagnostic-only.
 
 ```bash
 mkdir -p /tmp/codex-subagent-relay-smoke
@@ -59,3 +59,7 @@ That command consumes Provider quota. Delete the disposable directory when finis
 | `DEEPSEEK_WORKER_CLIPROXY_LOG_PATH` | CLIProxyAPI V2 canary request log | user-local CLIProxyAPI path |
 
 The `CLIPROXY` variables affect only the experimental native V2 canary. They are not required for external `run` or `launch` execution.
+
+## Automatic Provider Circuit
+
+Automatic runs persist a small private circuit state file at `~/.codex/deepseek-worker-circuit.json`, protected by a local lock and atomically replaced. After two no-side-effect failures for one Provider, that Provider is skipped for 30 seconds. A successful run clears its state. Explicit `--provider` runs bypass the circuit for diagnostics and recovery. If the state file cannot be read or written, routing fails open and continues normally. A write-side effect never triggers automatic replay or Provider fallback.

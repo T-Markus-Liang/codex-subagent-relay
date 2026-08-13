@@ -118,14 +118,19 @@ class ReleaseGateTests(unittest.TestCase):
             timeout=75,
             no_record=True,
         )
-        with tempfile.TemporaryDirectory() as workdir:
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as circuit_dir:
             args.workdir = workdir
             responses = [item for _ in range(32) for item in (invalid, valid)]
-            with patch.object(module, "invoke_codex", side_effect=responses) as invoke:
-                payloads = [module.run_worker(args) for _ in range(32)]
+            with patch.object(module, "invoke_codex", side_effect=responses) as invoke, \
+                 patch.object(module, "CIRCUIT_STATE_PATH", Path(circuit_dir) / "circuit.json"), \
+                 patch.object(module, "CIRCUIT_LOCK_PATH", Path(circuit_dir) / "circuit.lock"):
+                payloads = []
+                for _ in range(32):
+                    module.circuit_reset()
+                    payloads.append(module.run_worker(args))
         self.assertEqual(invoke.call_count, 64)
         self.assertTrue(all(payload["status"] == "success" for payload in payloads))
-        self.assertTrue(all(payload["provider"] == "sensenova1" for payload in payloads))
+        self.assertTrue(all(payload["provider"] == "sensenova" for payload in payloads))
         self.assertTrue(all(payload["timeout_seconds"] == 75 for payload in payloads))
 
     def test_parallel_write_lock_allows_one_owner_and_blocks_contenders(self):
@@ -219,7 +224,7 @@ class ReleaseGateTests(unittest.TestCase):
             recorded = log_path.read_text(encoding="utf-8")
         self.assertNotIn("task body", recorded)
         self.assertNotIn("sk-example-value", recorded)
-        self.assertEqual(set(json.loads(recorded).keys()), {"timestamp", "status", "provider", "role", "duration_seconds", "stream_finish_reason", "stream_retry_count", "usage"})
+        self.assertEqual(set(json.loads(recorded).keys()), {"timestamp", "run_type", "status", "provider", "role", "duration_seconds", "stream_finish_reason", "stream_retry_count", "usage"})
 
 
 if __name__ == "__main__":
