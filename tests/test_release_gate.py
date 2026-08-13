@@ -130,7 +130,7 @@ class ReleaseGateTests(unittest.TestCase):
                     payloads.append(module.run_worker(args))
         self.assertEqual(invoke.call_count, 64)
         self.assertTrue(all(payload["status"] == "success" for payload in payloads))
-        self.assertTrue(all(payload["provider"] == "sensenova" for payload in payloads))
+        self.assertTrue(all(payload["provider"] == module.RUNTIME_CONFIG["fallback"]["read_only"][1] for payload in payloads))
         self.assertTrue(all(payload["timeout_seconds"] == 75 for payload in payloads))
 
     def test_parallel_write_lock_allows_one_owner_and_blocks_contenders(self):
@@ -224,7 +224,16 @@ class ReleaseGateTests(unittest.TestCase):
             recorded = log_path.read_text(encoding="utf-8")
         self.assertNotIn("task body", recorded)
         self.assertNotIn("sk-example-value", recorded)
-        self.assertEqual(set(json.loads(recorded).keys()), {"timestamp", "run_type", "status", "provider", "role", "duration_seconds", "stream_finish_reason", "stream_retry_count", "usage"})
+        record = json.loads(recorded)
+        self.assertEqual(
+            set(record),
+            {
+                "timestamp", "run_type", "status", "provider", "role", "duration_seconds",
+                "stream_finish_reason", "stream_retry_count", "fallback_used", "partial_write", "usage",
+            },
+        )
+        self.assertIsInstance(record["fallback_used"], bool)
+        self.assertIsInstance(record["partial_write"], bool)
 
 
 if __name__ == "__main__":

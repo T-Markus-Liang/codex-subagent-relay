@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--poll-seconds", type=float, default=2.0, help="Delay between durable job polls.")
+    parser.add_argument("--job-deadline", type=float, default=180.0, help="Maximum wall-clock seconds for one launch/poll job.")
     parser.add_argument("--report", type=Path, required=True)
     return parser.parse_args()
 
@@ -72,24 +73,65 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[index], 2)
 
 
-def run_job(worker: str, command: list[str], poll_seconds: float) -> tuple[dict, float]:
-    """Drive the durable lifecycle so a long Provider call is never tied to one shell session."""
+def cancel_job(worker: str, job_id: str) -> dict:
+    result = subprocess.run(
+        [worker, "--json", "cancel", "--job-id", job_id],
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        payload = {"status": "invalid-output"}
+    return payload
+
+
+def run_job(worker: str, command: list[str], poll_seconds: float, deadline_seconds: float = 180.0) -> tuple[dict, float]:
+    """Drive one durable job with an outer deadline and same-job cancellation."""
+    if deadline_seconds <= 0:
+        raise ValueError("deadline_seconds must be positive")
     started = time.monotonic()
-    launched = subprocess.run([worker, "--json", "launch", *command], text=True, capture_output=True, check=False)
+    try:
+        launched = subprocess.run([worker, "--json", "launch", *command], text=True, capture_output=True, check=False, timeout=min(20.0, deadline_seconds))
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "risks": ["live soak launch command exceeded its outer deadline"]}, round(time.monotonic() - started, 2)
     try:
         launch_payload = json.loads(launched.stdout)
         job_id = str(launch_payload["job_id"])
     except (json.JSONDecodeError, KeyError, TypeError):
         return {"status": "invalid-output"}, round(time.monotonic() - started, 2)
-    while True:
-        polled = subprocess.run([worker, "--json", "poll", "--job-id", job_id], text=True, capture_output=True, check=False)
-        try:
-            payload = json.loads(polled.stdout)
-        except json.JSONDecodeError:
-            payload = {"status": "invalid-output"}
-        if payload.get("status") != "running":
-            return payload, round(time.monotonic() - started, 2)
-        time.sleep(max(0.1, poll_seconds))
+    try:
+        while True:
+            elapsed = time.monotonic() - started
+            if elapsed >= deadline_seconds:
+                cancelled = cancel_job(worker, job_id)
+                cancelled.setdefault("status", "cancelled")
+                cancelled["job_id"] = job_id
+                cancelled.setdefault("risks", []).append("live soak outer deadline reached; same durable job was cancelled")
+                return cancelled, round(time.monotonic() - started, 2)
+            try:
+                polled = subprocess.run([worker, "--json", "poll", "--job-id", job_id], text=True, capture_output=True, check=False, timeout=min(20.0, max(1.0, deadline_seconds - elapsed)))
+            except subprocess.TimeoutExpired:
+                cancelled = cancel_job(worker, job_id)
+                cancelled.setdefault("status", "cancelled")
+                cancelled["job_id"] = job_id
+                cancelled.setdefault("risks", []).append("live soak poll command exceeded its outer deadline; same durable job was cancelled")
+                return cancelled, round(time.monotonic() - started, 2)
+            try:
+                payload = json.loads(polled.stdout)
+            except json.JSONDecodeError:
+                payload = {"status": "invalid-output"}
+            if payload.get("status") != "running":
+                return payload, round(time.monotonic() - started, 2)
+            time.sleep(min(max(0.1, poll_seconds), max(0.1, deadline_seconds - (time.monotonic() - started))))
+    except KeyboardInterrupt:
+        cancelled = cancel_job(worker, job_id)
+        cancelled.setdefault("status", "cancelled")
+        cancelled["job_id"] = job_id
+        cancelled.setdefault("risks", []).append("live soak interrupted; same durable job was cancelled")
+        raise
 
 
 def main() -> int:
@@ -102,25 +144,17 @@ def main() -> int:
         raise SystemExit("worker command not found")
 
     records = []
+    interrupted = False
     for index in range(1, args.runs + 1):
-        with tempfile.TemporaryDirectory(prefix="deepseek-worker-soak-") as temporary_dir:
-            command = [
-                "--role",
-                args.role,
-                "--workdir",
-                temporary_dir,
-                "--provider",
-                args.provider,
-                "--timeout",
-                str(args.timeout),
-                "--no-record",
-                "--task",
-                task_for(args.role),
-            ]
-            payload, duration = run_job(args.worker, command, args.poll_seconds)
-            workspace_ok, workspace_reason = verify_workspace(Path(temporary_dir), args.role)
-            records.append(
-                {
+        try:
+            with tempfile.TemporaryDirectory(prefix="deepseek-worker-soak-") as temporary_dir:
+                command = [
+                    "--role", args.role, "--workdir", temporary_dir, "--provider", args.provider,
+                    "--timeout", str(args.timeout), "--no-record", "--task", task_for(args.role),
+                ]
+                payload, duration = run_job(args.worker, command, args.poll_seconds, args.job_deadline)
+                workspace_ok, workspace_reason = verify_workspace(Path(temporary_dir), args.role)
+                records.append({
                     "run": index,
                     "status": payload.get("status", "invalid-output"),
                     "duration_seconds": duration,
@@ -131,8 +165,10 @@ def main() -> int:
                     "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
                     "workspace_ok": workspace_ok,
                     "failure_class": failure_class(payload, workspace_reason),
-                }
-            )
+                })
+        except KeyboardInterrupt:
+            interrupted = True
+            break
 
     durations = [record["duration_seconds"] for record in records]
     successes = sum(record["status"] == "success" and record["workspace_ok"] for record in records)
@@ -141,9 +177,11 @@ def main() -> int:
         "worker": args.worker,
         "provider": args.provider,
         "role": args.role,
-        "runs": args.runs,
+        "runs": len(records),
+        "requested_runs": args.runs,
+        "interrupted": interrupted,
         "successes": successes,
-        "success_rate_percent": round(100 * successes / args.runs, 2),
+        "success_rate_percent": round(100 * successes / len(records), 2) if records else 0.0,
         "p50_duration_seconds": percentile(durations, 0.5),
         "p95_duration_seconds": percentile(durations, 0.95),
         "status_counts": {status: sum(record["status"] == status for record in records) for status in sorted({record["status"] for record in records})},
@@ -155,6 +193,16 @@ def main() -> int:
         "fallback_runs": sum(record["fallback_used"] for record in records),
         "partial_write_runs": sum(record["partial_write"] for record in records),
         "workspace_verification_failures": sum(not record["workspace_ok"] for record in records),
+        "duplicate_write_incidents": (
+            0
+            if args.role == "documentation" and all(record["workspace_ok"] and not record["partial_write"] for record in records)
+            else None
+        ),
+        "write_safety_violations": (
+            sum(record["partial_write"] or not record["workspace_ok"] for record in records)
+            if args.role == "documentation"
+            else 0
+        ),
         "failure_classes": {
             reason: sum(record["failure_class"] == reason for record in records)
             for reason in sorted({record["failure_class"] for record in records if record["failure_class"] is not None})
@@ -164,7 +212,7 @@ def main() -> int:
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, separators=(",", ":")))
-    return 0 if successes == args.runs else 1
+    return 0 if not interrupted and successes == args.runs else 1
 
 
 if __name__ == "__main__":

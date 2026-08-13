@@ -1,0 +1,20 @@
+{
+  "name": "codex-subagent-relay",
+  "version": "0.10.0",
+  "description": "Typed local MCP tools for durable third-party Codex execution jobs.",
+  "author": {
+    "name": "T-Markus-Liang",
+    "url": "https://github.com/T-Markus-Liang"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Subagent Relay",
+    "shortDescription": "Route bounded execution work through durable Relay jobs.",
+    "longDescription": "Use typed local Relay tools for DeepSeek execution jobs while preserving Codex root Provider identity and conversation history.",
+    "developerName": "T-Markus-Liang",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": "Delegate this bounded implementation task through Codex Subagent Relay."
+  },
+  "mcpServers": "./.mcp.json"
+}

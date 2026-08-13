@@ -56,6 +56,24 @@ class LiveSoakTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0][:3], ["worker", "--json", "launch"])
         self.assertEqual(run.call_args_list[1].args[0], ["worker", "--json", "poll", "--job-id", "job-1"])
 
+    def test_run_job_cancels_same_job_at_outer_deadline(self):
+        class Completed:
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        responses = iter([
+            Completed(json.dumps({"status": "running", "job_id": "job-timeout"})),
+            Completed(json.dumps({"status": "running", "job_id": "job-timeout"})),
+            Completed(json.dumps({"status": "blocked", "job_id": "job-timeout", "job_state": "cancelled"})),
+        ])
+        clock = iter([0.0, 0.0, 2.0, 2.0, 2.0])
+        with patch.object(module.subprocess, "run", side_effect=lambda *args, **kwargs: next(responses)) as run, \
+             patch.object(module.time, "monotonic", side_effect=lambda: next(clock)), \
+             patch.object(module.time, "sleep"):
+            payload, _duration = module.run_job("worker", ["--role", "documentation"], 0.1, deadline_seconds=1.0)
+        self.assertEqual(payload["job_state"], "cancelled")
+        self.assertEqual(run.call_args_list[-1].args[0], ["worker", "--json", "cancel", "--job-id", "job-timeout"])
+
 
 if __name__ == "__main__":
     unittest.main()

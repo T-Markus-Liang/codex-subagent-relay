@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "codex-subagent-relay": {
+      "command": "./mcp/relay-mcp",
+      "cwd": "."
+    }
+  }
+}

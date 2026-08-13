@@ -1,0 +1,37 @@
+name: Stable Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify release gates
+        run: |
+          make release-gate
+          python scripts/validate_compatibility.py --require-evidence
+      - name: Verify tag matches relay version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          VERSION=$(python -c 'import re; print(re.search(r"VERSION = \\"([^\\"]+)\\"", open("deepseek-worker").read()).group(1))')
+          test "$RELEASE_TAG" = "v$VERSION"
+      - name: Package source
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: git archive --format=tar.gz --prefix="codex-subagent-relay-${RELEASE_TAG}/" "$RELEASE_TAG" > "codex-subagent-relay-${RELEASE_TAG}.tar.gz"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" "codex-subagent-relay-${RELEASE_TAG}.tar.gz" --generate-notes

@@ -1,0 +1,20 @@
+{
+  "name": "codex-subagent-relay",
+  "interface": {
+    "displayName": "Codex Subagent Relay"
+  },
+  "plugins": [
+    {
+      "name": "codex-subagent-relay",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-subagent-relay"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -51,7 +51,7 @@ DEEPSEEK_WORKER_OPENCODE_PATH=/absolute/path/to/opencode deepseek-worker --json 
 
 `healthy` means Codex is available, OpenCode is executable, the root Provider is `openai-chatgpt`, expected profiles identify the expected model, health URLs respond, and the candidate native model catalog can be read.
 
-`healthy` is not a live task success guarantee. Before real work, run one disposable read-only smoke against each route you plan to use. Automatic read routing starts with `sensenova1`, then falls back to `sensenova`; `opencode-go` remains explicit-diagnostic-only.
+`healthy` is not a live task success guarantee. Before real work, run one disposable read-only smoke against each route you plan to use. The checked-in automatic order is currently `sensenova`, then `sensenova1`, based on the latest explicit smoke evidence; change it only after a fresh comparison. `opencode-go` remains explicit-diagnostic-only.
 
 ```bash
 mkdir -p /tmp/codex-subagent-relay-smoke
@@ -71,6 +71,20 @@ That command consumes Provider quota. Delete the disposable directory when finis
 | `DEEPSEEK_WORKER_CLIPROXY_LOG_PATH` | CLIProxyAPI V2 canary request log | user-local CLIProxyAPI path |
 
 The `CLIPROXY` variables affect only the experimental native V2 canary. They are not required for external `run` or `launch` execution.
+
+## Job Artifact Retention
+
+Each Relay job stays under the private `~/.codex/deepseek-worker-jobs/` directory for inspection.
+To preview expired **terminal** jobs, run:
+
+```bash
+deepseek-worker --json cleanup --retention-hours 168
+```
+
+The default is seven days. Add `--apply` only after reviewing `candidate_job_ids`. Cleanup never
+deletes queued or running jobs, and skips malformed job directories instead of guessing whether they
+are safe to remove. Retention is local operational hygiene; it does not alter Codex state, threads,
+Provider configuration, or run-log aggregation.
 
 ## Automatic Provider Circuit
 

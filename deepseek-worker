@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -55,6 +55,8 @@ JOB_SCHEMA_VERSION = 1
 JOB_STATES = {"queued", "running", "succeeded", "partial", "blocked", "failed", "cancelled", "timed_out"}
 TERMINAL_JOB_STATES = {"succeeded", "partial", "blocked", "failed", "cancelled", "timed_out"}
 JOB_TIMEOUT_GRACE_SECONDS = 15
+DEFAULT_TERMINAL_JOB_RETENTION_HOURS = 168
+MAX_TERMINAL_JOB_RETENTION_HOURS = 24 * 365
 
 class WorkerError(RuntimeError):
     pass
@@ -268,6 +270,27 @@ def redact(text: str, limit: int = 1200) -> str:
     return compact[-limit:]
 
 
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
+    return round(ordered[index], 2)
+
+
+def redact_summary(summary: str, workdir: Path) -> str:
+    """Keep model summaries useful while removing the task absolute workdir."""
+    replacements = {str(workdir), str(workdir.resolve()), os.path.realpath(str(workdir))}
+    if str(workdir).startswith("/private/"):
+        replacements.add(str(workdir)[len("/private"):])
+    elif str(workdir).startswith("/"):
+        replacements.add("/private" + str(workdir))
+    value = summary
+    for path in sorted(replacements, key=len, reverse=True):
+        value = value.replace(path, "[WORKDIR]")
+    return value[:4000]
+
+
 def load_task(task: str | None, task_file: str | None) -> str:
     if bool(task) == bool(task_file):
         raise WorkerError("provide exactly one of --task or --task-file")
@@ -309,28 +332,31 @@ def route(role: str, task: str = "") -> dict[str, Any]:
     if normalized in TERRA_ROLES:
         return {"target": "terra", "role": normalized, "reason": "review_or_validation"}
     if normalized in READ_ONLY_ROLES:
+        provider = RUNTIME_CONFIG["fallback"]["read_only"][0]
         return {
             "target": "deepseek",
             "role": normalized,
-            "provider": "sensenova1",
-            "profile": PROVIDERS["sensenova1"]["profile"],
+            "provider": provider,
+            "profile": PROVIDERS[provider]["profile"],
             "sandbox": "read-only",
             "reason": "read_heavy_execution",
         }
     if normalized in WORKER_ROLES:
+        provider = RUNTIME_CONFIG["fallback"]["worker"][0]
         return {
             "target": "deepseek",
             "role": normalized,
-            "provider": "sensenova1",
-            "profile": PROVIDERS["sensenova1"]["profile"],
+            "provider": provider,
+            "profile": PROVIDERS[provider]["profile"],
             "sandbox": "workspace-write",
             "reason": "execution_task",
         }
+    provider = RUNTIME_CONFIG["fallback"]["general"][0]
     return {
         "target": "deepseek",
         "role": normalized,
-        "provider": "sensenova1",
-        "profile": PROVIDERS["sensenova1"]["profile"],
+        "provider": provider,
+        "profile": PROVIDERS[provider]["profile"],
         "sandbox": "workspace-write",
         "reason": "general_execution",
     }
@@ -1179,15 +1205,18 @@ def invoke_codex(
 
 
 def record_run(payload: dict[str, Any], run_type: str = "external_run") -> None:
+    risks = payload.get("risks") or []
     record = {
         "timestamp": datetime.now(UTC).isoformat(),
         "run_type": run_type,
         "status": payload.get("status"),
-        "provider": payload.get("provider"),
-        "role": payload.get("role"),
+        "provider": payload.get("provider") or "unknown",
+        "role": payload.get("role") or "unknown",
         "duration_seconds": payload.get("duration_seconds"),
         "stream_finish_reason": payload.get("stream_finish_reason"),
         "stream_retry_count": payload.get("stream_retry_count", 0),
+        "fallback_used": "provider fallback was used after an earlier DeepSeek route failed" in risks,
+        "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
         "usage": payload.get("usage", {}),
     }
     RUN_LOG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1630,6 +1659,76 @@ def inspect_job(job_id: str) -> dict[str, Any]:
     return payload
 
 
+def terminal_job_finished_at(metadata: dict[str, Any]) -> datetime | None:
+    """Return a terminal timestamp only for a well-formed, finished job."""
+    if metadata.get("state") not in TERMINAL_JOB_STATES:
+        return None
+    try:
+        value = datetime.fromisoformat(str(metadata["finished_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def cleanup_terminal_jobs(retention_hours: float, apply: bool = False) -> dict[str, Any]:
+    """Preview or remove only expired terminal directories under the private job root."""
+    if not 0 <= retention_hours <= MAX_TERMINAL_JOB_RETENTION_HOURS:
+        raise WorkerError(f"retention hours must be between 0 and {MAX_TERMINAL_JOB_RETENTION_HOURS}")
+    cutoff = datetime.now(UTC) - timedelta(hours=retention_hours)
+    candidates: list[str] = []
+    skipped = {"active": 0, "invalid": 0, "recent": 0}
+    try:
+        directories = list(JOB_ROOT.iterdir())
+    except OSError:
+        directories = []
+    for directory in directories:
+        if not directory.is_dir() or directory.name == "idempotency":
+            continue
+        try:
+            metadata = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            skipped["invalid"] += 1
+            continue
+        if not isinstance(metadata, dict) or metadata.get("job_id") != directory.name:
+            skipped["invalid"] += 1
+            continue
+        finished_at = terminal_job_finished_at(metadata)
+        if finished_at is None:
+            skipped["active"] += 1
+            continue
+        if finished_at > cutoff:
+            skipped["recent"] += 1
+            continue
+        candidates.append(directory.name)
+    removed: list[str] = []
+    if apply:
+        for job_id in candidates:
+            directory = JOB_ROOT / job_id
+            # Recheck before removal so a concurrent transition is never deleted.
+            try:
+                metadata = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                skipped["invalid"] += 1
+                continue
+            finished_at = terminal_job_finished_at(metadata) if isinstance(metadata, dict) and metadata.get("job_id") == job_id else None
+            if finished_at is None or finished_at > cutoff:
+                skipped["active"] += 1
+                continue
+            try:
+                shutil.rmtree(directory)
+                removed.append(job_id)
+            except OSError:
+                skipped["invalid"] += 1
+    return {
+        "status": "success",
+        "retention_hours": retention_hours,
+        "dry_run": not apply,
+        "candidate_job_ids": candidates,
+        "removed_job_ids": removed,
+        "skipped": skipped,
+    }
+
+
 def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     task = load_task(args.task, args.task_file)
     decision = route(args.role, task)
@@ -1837,7 +1936,7 @@ def _run_worker_locked(
             "provider": provider,
             "profile": profile,
             "role": decision["role"],
-            "summary": str(message.get("summary", ""))[:4000],
+            "summary": redact_summary(str(message.get("summary", "")), workdir),
             "files_changed": sorted(set(message.get("files_changed", [])) | set(detected)),
             "tests": list(message.get("tests", [])),
             "risks": list(message.get("risks", []))
@@ -2442,13 +2541,40 @@ def stats(hours: float) -> dict[str, Any]:
     by_provider: dict[str, int] = {}
     by_run_type: dict[str, dict[str, Any]] = {}
     provider_stats: dict[str, dict[str, Any]] = {}
+    role_stats: dict[str, dict[str, Any]] = {}
     total_input = total_cached = total_cache_write = total_output = total_reasoning = 0
+    durations: list[float] = []
+    fallback_runs = partial_write_runs = stream_retry_runs = 0
+
+    def add_aggregate(detail: dict[str, Any], row: dict[str, Any], status: str, duration: float) -> None:
+        detail["runs"] += 1
+        detail["status_counts"][status] = detail["status_counts"].get(status, 0) + 1
+        detail["_durations"].append(duration)
+        detail["fallback_runs"] += int(bool(row.get("fallback_used")))
+        detail["partial_write_runs"] += int(bool(row.get("partial_write")))
+        detail["stream_retry_runs"] += int(int(row.get("stream_retry_count") or 0) > 0)
+
+    def aggregate() -> dict[str, Any]:
+        return {
+            "runs": 0,
+            "status_counts": {},
+            "_durations": [],
+            "fallback_runs": 0,
+            "partial_write_runs": 0,
+            "stream_retry_runs": 0,
+        }
+
     for row in rows:
         status = str(row.get("status", "unknown"))
         run_type = str(row.get("run_type", "external_run"))
         status_counts[status] = status_counts.get(status, 0) + 1
-        provider = str(row.get("provider", "unknown"))
+        provider = str(row.get("provider") or "unknown")
         by_provider[provider] = by_provider.get(provider, 0) + 1
+        duration = float(row.get("duration_seconds") or 0)
+        durations.append(duration)
+        fallback_runs += int(bool(row.get("fallback_used")))
+        partial_write_runs += int(bool(row.get("partial_write")))
+        stream_retry_runs += int(int(row.get("stream_retry_count") or 0) > 0)
         run_detail = by_run_type.setdefault(run_type, {"runs": 0, "successes": 0, "status_counts": {}})
         run_detail["runs"] += 1
         if status == "success":
@@ -2466,20 +2592,25 @@ def stats(hours: float) -> dict[str, Any]:
         total_output += output_tokens
         total_reasoning += reasoning_output_tokens
         detail = provider_stats.setdefault(provider, {
-            "runs": 0,
-            "status_counts": {},
+            **aggregate(),
             "success_rate_percent": 0.0,
             "duration_seconds": 0.0,
             "usage": {"input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0},
         })
-        detail["runs"] += 1
-        detail["status_counts"][status] = detail["status_counts"].get(status, 0) + 1
-        detail["duration_seconds"] += float(row.get("duration_seconds") or 0)
+        add_aggregate(detail, row, status, duration)
+        detail["duration_seconds"] += duration
+        role = str(row.get("role") or "unknown")
+        add_aggregate(role_stats.setdefault(role, aggregate()), row, status, duration)
         for key, value in (("input_tokens", input_tokens), ("cached_input_tokens", cached_input_tokens), ("cache_write_input_tokens", cache_write_input_tokens), ("output_tokens", output_tokens), ("reasoning_output_tokens", reasoning_output_tokens)):
             detail["usage"][key] += value
+    for detail in [*provider_stats.values(), *role_stats.values()]:
+        duration_values = detail.pop("_durations")
+        detail["p50_duration_seconds"] = percentile(duration_values, 0.5)
+        detail["p95_duration_seconds"] = percentile(duration_values, 0.95)
+        detail["success_rate_percent"] = round(100 * detail["status_counts"].get("success", 0) / detail["runs"], 2)
     for detail in provider_stats.values():
         detail["duration_seconds"] = round(detail["duration_seconds"], 2)
-        detail["success_rate_percent"] = round(100 * detail["status_counts"].get("success", 0) / detail["runs"], 2)
+    unknown_attribution = sum(1 for row in rows if not row.get("provider") or not row.get("role"))
     return {
         "status": "success",
         "window_hours": hours,
@@ -2490,6 +2621,19 @@ def stats(hours: float) -> dict[str, Any]:
         "by_run_type": by_run_type,
         "status_counts": status_counts,
         "provider_stats": provider_stats,
+        "role_stats": role_stats,
+        "reliability": {
+            "p50_duration_seconds": percentile(durations, 0.5),
+            "p95_duration_seconds": percentile(durations, 0.95),
+            "fallback_runs": fallback_runs,
+            "partial_write_runs": partial_write_runs,
+            "stream_retry_runs": stream_retry_runs,
+        },
+        "coverage_warnings": (
+            ["some run records lacked Provider or role attribution; those records are grouped under unknown"]
+            if unknown_attribution
+            else []
+        ),
         "circuit": circuit_summary(),
         "usage": {
             "input_tokens": total_input,
@@ -2584,6 +2728,10 @@ def parser() -> argparse.ArgumentParser:
     inspect_parser = commands.add_parser("inspect", help="Inspect one durable job's metadata, manifests, and bounded result.")
     inspect_parser.add_argument("--job-id", required=True)
 
+    cleanup_parser = commands.add_parser("cleanup", help="Preview or remove expired terminal job artifacts; active jobs are always retained.")
+    cleanup_parser.add_argument("--retention-hours", type=float, default=DEFAULT_TERMINAL_JOB_RETENTION_HOURS)
+    cleanup_parser.add_argument("--apply", action="store_true", help="Actually delete eligible terminal job directories. Omit for a dry run.")
+
     smoke_parser = commands.add_parser("smoke-test", help="Run a tiny read-only live task through one provider.")
     smoke_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
     smoke_parser.add_argument("--workdir", default=str(Path.cwd()))
@@ -2638,6 +2786,8 @@ def main() -> int:
             payload = list_jobs(args.limit)
         elif args.command == "inspect":
             payload = inspect_job(args.job_id)
+        elif args.command == "cleanup":
+            payload = cleanup_terminal_jobs(args.retention_hours, args.apply)
         elif args.command == "smoke-test":
             run_args = argparse.Namespace(
                 task="Inspect the current directory without modifying files. Reply with a short success summary.",

@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.0.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -13,7 +13,7 @@ It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, Ope
 
 ## What It Does
 
-- Routes read-heavy work to `sensenova1` first and falls back to `sensenova`; write-heavy work uses the same order.
+- Routes automatic work to the currently qualified/healthy Provider first and uses the other SenseNova route as bounded fallback. The checked-in order is currently `sensenova -> sensenova1` because the latest explicit smoke showed `sensenova` healthy while `sensenova1` returned upstream stream errors. Re-run explicit smoke before changing this order.
 - Requires real tool activity, a healthy terminal stream, a strict five-field JSON result, and a matching workspace diff before accepting a result.
 - Retries a stream failure once, then uses bounded Provider fallback only when the workspace is unchanged.
 - Stops on a partial write rather than replaying the task with another Provider.
@@ -102,6 +102,8 @@ deepseek-worker --json status --job-id <job_id>
 deepseek-worker --json cancel --job-id <job_id>
 deepseek-worker --json list --limit 20
 deepseek-worker --json inspect --job-id <job_id>
+deepseek-worker --json cleanup --retention-hours 168
+deepseek-worker --json cleanup --retention-hours 168 --apply
 ```
 
 Every accepted terminal result has this exact core contract:
@@ -122,13 +124,17 @@ The relay adds bounded metadata such as Provider, duration, usage, and stream re
 
 | Role family | Default Provider order | Sandbox | Default budget |
 | --- | --- | --- | --- |
-| `search`, `repository-exploration`, `logs` | `sensenova1 -> sensenova` | read-only | 75 seconds |
-| `implementation`, `test`, `debug`, `refactor`, `docs` | `sensenova1 -> sensenova` | workspace-write | 120 seconds |
+| `search`, `repository-exploration`, `logs` | `sensenova -> sensenova1` | read-only | 75 seconds |
+| `implementation`, `test`, `debug`, `refactor`, `docs` | `sensenova -> sensenova1` | workspace-write | 120 seconds |
 | architecture, planning, final review | kept by the caller | n/a | n/a |
 
 `opencode-go` is available only with an explicit `--provider` for diagnostics; it is not part of automatic production fallback. The Worker serializes concurrent write tasks per workdir. A write that changes files but fails the result contract returns `partial` and stops all retry/fallback. Review that diff manually.
 
-Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
+Terminal job artifacts are retained for seven days by default. Cleanup is a dry run unless
+`--apply` is supplied; it never deletes queued/running jobs, malformed directories, or jobs completed
+inside the specified retention window. Review the candidate IDs before applying cleanup.
+
+Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. It reports overall plus role/Provider success rates, p50/p95 duration, fallback, partial-write, and stream-retry counts. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
 
 Automatic routing maintains a short-lived per-Provider circuit in `~/.codex/deepseek-worker-circuit.json`. Two no-side-effect failures temporarily skip a Provider for 30 seconds, allowing the other route to run without spending its full timeout. Explicit `--provider` diagnostics bypass this state. State persistence is fail-open: an unreadable or unwritable circuit file never blocks a task. Any workspace side effect still stops retry and fallback.
 
@@ -148,6 +154,7 @@ deepseek-worker --json status --job-id <job_id>
 deepseek-worker --json cancel --job-id <job_id>
 deepseek-worker --json list --limit 20
 deepseek-worker --json inspect --job-id <job_id>
+deepseek-worker --json cleanup --retention-hours 168
 deepseek-worker --json smoke-test --provider sensenova --workdir /path/to/repo
 deepseek-worker --json stats --hours 8
 ```
@@ -156,9 +163,36 @@ deepseek-worker --json stats --hours 8
 
 `catalog-build`, `native-check`, `native-v1-canary`, and `cliproxy-native-canary` are experimental diagnostics. Native V1/V2 results do not establish production route reliability. See [Configuration](docs/CONFIGURATION.md) and [Release Testing](docs/RELEASE_TESTING.md).
 
+## Codex Plugin And MCP
+
+The bundled plugin package exposes the stable Relay lifecycle as local typed MCP tools:
+relay_doctor, relay_launch, relay_status, relay_cancel, and relay_stats. It is a thin stdio facade
+over this repository's Worker command: it does not receive Provider credentials, call a Provider
+directly, or mutate Codex Provider/session configuration.
+
+The repository includes a marketplace manifest at `.agents/plugins/marketplace.json`. Add the
+repository as a local or Git marketplace, then install the plugin:
+
+```bash
+codex plugin marketplace add /absolute/path/to/codex-subagent-relay
+codex plugin add codex-subagent-relay@codex-subagent-relay
+```
+
+For a Git checkout, use the repository URL instead of the local path. Validate the package with the
+Codex plugin validator before installing it in Codex. After installation, start a new Codex thread
+so the thread loads the updated Skill and MCP tool declarations.
+
+The external Relay remains the production execution backend. Native Codex Subagents remain
+canary-only until their independent promotion gate passes.
+
+The tracked compatibility manifest is structurally valid without live evidence. A stable
+publication requires separate qualifying records for both production routes. Run
+scripts/validate_compatibility.py with --require-evidence to enforce that gate; it intentionally
+fails while either route lacks 100 read plus 100 write qualifying evidence.
+
 ## Testing
 
-`make release-gate` is credential-free and runs deterministic unit, fault-injection, fallback, concurrency, job-isolation, redaction, qualification-workspace, and install-launcher checks. GitHub Actions runs this same gate for pushes and pull requests. Live Provider soaks are opt-in, consume quota, and require a disposable directory per attempt. The runner defaults to the actual `auto` route and verifies that reads are non-mutating and writes produce exactly the expected file. The exact commands, metrics, and pass/fail thresholds are in [Release Testing](docs/RELEASE_TESTING.md).
+`make release-gate` is credential-free and runs deterministic unit, fault-injection, fallback, concurrency, job-isolation, redaction, qualification-workspace, plugin-package, and install-launcher checks. GitHub Actions runs this same gate for pushes and pull requests. Live Provider soaks are opt-in, consume quota, and require a disposable directory per attempt. The runner defaults to the actual `auto` route, uses a bounded per-job deadline, cancels the same durable job on interruption, and verifies that reads are non-mutating and writes produce exactly the expected file. The exact commands, metrics, and pass/fail thresholds are in [Release Testing](docs/RELEASE_TESTING.md).
 
 ## Contributing And Security
 

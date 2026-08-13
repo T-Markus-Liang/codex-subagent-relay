@@ -1,0 +1,40 @@
+{
+  "relay_version": "0.10.0",
+  "minimum_python": "3.11",
+  "adapter": "opencode",
+  "production_routes": [
+    {
+      "provider": "sensenova",
+      "model": "sensenova/deepseek-v4-flash"
+    },
+    {
+      "provider": "sensenova1",
+      "model": "sensenova1/deepseek-v4-flash"
+    }
+  ],
+  "native": {
+    "status": "canary_only"
+  },
+  "qualification": {
+    "sequential_read_jobs": 100,
+    "sequential_write_jobs": 100,
+    "min_success_rate": 0.95,
+    "zero_duplicate_writes": true
+  },
+  "evidence": {
+    "schema_version": 1,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "route": { "type": "string" },
+        "read_jobs": { "type": "integer" },
+        "write_jobs": { "type": "integer" },
+        "read_success_rate": { "type": "number" },
+        "write_success_rate": { "type": "number" },
+        "duplicate_writes": { "type": "integer" }
+      },
+      "required": ["route", "read_jobs", "write_jobs", "read_success_rate", "write_success_rate", "duplicate_writes"]
+    },
+    "records": []
+  }
+}

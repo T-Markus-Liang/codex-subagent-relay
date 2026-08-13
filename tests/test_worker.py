@@ -20,8 +20,8 @@ loader.exec_module(module)
 class RouterTests(unittest.TestCase):
     def test_declarative_runtime_config_matches_current_production_policy(self):
         config = module.load_runtime_config(module.ROOT / "relay.toml")
-        self.assertEqual(config["fallback"]["read_only"], ("sensenova1", "sensenova"))
-        self.assertEqual(config["fallback"]["worker"], ("sensenova1", "sensenova"))
+        self.assertEqual(config["fallback"]["read_only"], ("sensenova", "sensenova1"))
+        self.assertEqual(config["fallback"]["worker"], ("sensenova", "sensenova1"))
         self.assertEqual(config["providers"]["sensenova1"]["adapter"], "opencode")
         self.assertEqual(config["timeouts"]["read_only_seconds"], 75)
 
@@ -189,6 +189,44 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(inspected["result"]["status"], "success")
             self.assertNotIn("events", inspected)
 
+    def test_cleanup_previews_only_old_terminal_jobs_and_keeps_active_or_invalid_jobs(self):
+        with tempfile.TemporaryDirectory() as jobs:
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                old_id = "1700000000-abcdef123456"
+                recent_id = "1700000001-abcdef123457"
+                active_id = "1700000002-abcdef123458"
+                old_finished = (module.datetime.now(module.UTC) - module.timedelta(hours=169)).isoformat()
+                recent_finished = (module.datetime.now(module.UTC) - module.timedelta(hours=1)).isoformat()
+                for job_id, state, finished_at in ((old_id, "succeeded", old_finished), (recent_id, "failed", recent_finished), (active_id, "running", None)):
+                    metadata, _stdout, _stderr = module.job_paths(job_id)
+                    data = {"schema_version": 1, "job_id": job_id, "state": state}
+                    if finished_at:
+                        data["finished_at"] = finished_at
+                    module.write_json(metadata, data)
+                invalid = Path(jobs) / "invalid-job"
+                invalid.mkdir()
+                (invalid / "meta.json").write_text("not json", encoding="utf-8")
+
+                preview = module.cleanup_terminal_jobs(168)
+                self.assertTrue(preview["dry_run"])
+                self.assertEqual(preview["candidate_job_ids"], [old_id])
+                self.assertTrue((Path(jobs) / old_id).is_dir())
+                self.assertGreaterEqual(preview["skipped"]["active"], 1)
+                self.assertGreaterEqual(preview["skipped"]["invalid"], 1)
+
+                applied = module.cleanup_terminal_jobs(168, apply=True)
+                self.assertFalse(applied["dry_run"])
+                self.assertEqual(applied["removed_job_ids"], [old_id])
+                self.assertFalse((Path(jobs) / old_id).exists())
+                self.assertTrue((Path(jobs) / recent_id).is_dir())
+                self.assertTrue((Path(jobs) / active_id).is_dir())
+
+    def test_cleanup_rejects_unbounded_retention(self):
+        with self.assertRaises(module.WorkerError):
+            module.cleanup_terminal_jobs(-1)
+        with self.assertRaises(module.WorkerError):
+            module.cleanup_terminal_jobs(module.MAX_TERMINAL_JOB_RETENTION_HOURS + 1)
+
     def test_cancel_marks_job_without_replaying_and_preserves_changes(self):
         with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as jobs:
             job_id = "1700000000-abcdef123456"
@@ -267,12 +305,12 @@ class RouterTests(unittest.TestCase):
 
     def test_explorer_route(self):
         result = module.route("repository-exploration")
-        self.assertEqual(result["provider"], "sensenova1")
+        self.assertEqual(result["provider"], module.RUNTIME_CONFIG["fallback"]["read_only"][0])
         self.assertEqual(result["sandbox"], "read-only")
 
     def test_worker_route(self):
         result = module.route("implementation")
-        self.assertEqual(result["provider"], "sensenova1")
+        self.assertEqual(result["provider"], module.RUNTIME_CONFIG["fallback"]["worker"][0])
         self.assertEqual(result["sandbox"], "workspace-write")
 
     def test_worker_prompt_contains_literal_result_contract(self):
@@ -312,6 +350,23 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["status"], "error")
         self.assertTrue(any("declared files do not match" in risk for risk in payload["risks"]))
 
+    def test_accepted_summary_redacts_absolute_workdir(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            workdir = Path(temporary_dir)
+            response = json.dumps({"status": "success", "summary": f"Inspected {workdir} successfully", "files_changed": [], "tests": [], "risks": []})
+            events = "\n".join(map(json.dumps, [
+                {"type": "tool_use", "part": {"state": {"status": "completed"}}},
+                {"type": "text", "part": {"text": response}},
+                {"type": "step_finish", "part": {"reason": "stop"}},
+            ]))
+            completed = module.subprocess.CompletedProcess([], 0, events, "")
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=str(workdir), provider="sensenova1", sandbox="read-only", timeout=90, no_record=True)
+            with patch.object(module, "invoke_codex", return_value=completed):
+                payload = module.run_worker(args)
+        self.assertEqual(payload["status"], "success")
+        self.assertNotIn(str(workdir), payload["summary"])
+        self.assertIn("[WORKDIR]", payload["summary"])
+
     def test_non_git_workdir_snapshot_detects_file_changes(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             workdir = Path(temporary_dir)
@@ -325,17 +380,17 @@ class RouterTests(unittest.TestCase):
     def test_auto_route(self):
         self.assertEqual(module.route("auto", "debug a failing test")["target"], "deepseek")
 
-    def test_general_route_uses_sensenova1(self):
-        self.assertEqual(module.route("general-execution")["provider"], "sensenova1")
+    def test_general_route_uses_declared_primary_provider(self):
+        self.assertEqual(module.route("general-execution")["provider"], "sensenova")
 
     def test_auto_provider_order_is_role_specific(self):
         self.assertEqual(
-            module.build_provider_order("repository-exploration", "sensenova1", True),
-            ["sensenova1", "sensenova"],
+            module.build_provider_order("repository-exploration", "sensenova", True),
+            ["sensenova", "sensenova1"],
         )
         self.assertEqual(
-            module.build_provider_order("implementation", "sensenova1", True),
-            ["sensenova1", "sensenova"],
+            module.build_provider_order("implementation", "sensenova", True),
+            ["sensenova", "sensenova1"],
         )
 
     def test_circuit_breaker_persists_across_calls_and_explicit_provider_bypasses(self):
@@ -388,9 +443,9 @@ class RouterTests(unittest.TestCase):
             log = Path(temporary_dir) / "runs.jsonl"
             base_time = module.datetime.now(module.UTC).replace(microsecond=0)
             log.write_text("\n".join([
-                json.dumps({"timestamp": base_time.isoformat(), "run_type": "external_run", "status": "success", "provider": "sensenova", "duration_seconds": 10, "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
-                json.dumps({"timestamp": (base_time - module.timedelta(minutes=1)).isoformat(), "run_type": "native_v1_canary", "status": "partial", "provider": "sensenova1", "duration_seconds": 20, "usage": {"input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 2}}),
-                json.dumps({"timestamp": (base_time - module.timedelta(minutes=2)).isoformat(), "run_type": "external_run", "status": "error", "provider": "sensenova1", "duration_seconds": 30, "usage": {"input_tokens": 30, "cached_input_tokens": 6, "output_tokens": 5, "reasoning_output_tokens": 3}}),
+                json.dumps({"timestamp": base_time.isoformat(), "run_type": "external_run", "status": "success", "provider": "sensenova", "role": "repository-exploration", "duration_seconds": 10, "fallback_used": False, "partial_write": False, "stream_retry_count": 0, "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
+                json.dumps({"timestamp": (base_time - module.timedelta(minutes=1)).isoformat(), "run_type": "native_v1_canary", "status": "partial", "provider": "sensenova1", "role": "implementation", "duration_seconds": 20, "fallback_used": False, "partial_write": True, "stream_retry_count": 1, "usage": {"input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 2}}),
+                json.dumps({"timestamp": (base_time - module.timedelta(minutes=2)).isoformat(), "run_type": "external_run", "status": "error", "provider": "sensenova1", "role": "implementation", "duration_seconds": 30, "fallback_used": True, "partial_write": False, "stream_retry_count": 0, "usage": {"input_tokens": 30, "cached_input_tokens": 6, "output_tokens": 5, "reasoning_output_tokens": 3}}),
             ]) + "\n")
             with patch.object(module, "RUN_LOG_PATH", log):
                 payload = module.stats(2)
@@ -399,6 +454,33 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["provider_stats"]["sensenova1"]["success_rate_percent"], 0.0)
         self.assertEqual(payload["by_run_type"]["external_run"]["runs"], 2)
         self.assertEqual(payload["by_run_type"]["native_v1_canary"]["runs"], 1)
+        self.assertEqual(payload["role_stats"]["implementation"]["runs"], 2)
+        self.assertEqual(payload["reliability"]["p50_duration_seconds"], 20.0)
+        self.assertEqual(payload["reliability"]["p95_duration_seconds"], 30.0)
+        self.assertEqual(payload["reliability"]["fallback_runs"], 1)
+        self.assertEqual(payload["reliability"]["partial_write_runs"], 1)
+        self.assertEqual(payload["reliability"]["stream_retry_runs"], 1)
+        self.assertEqual(payload["coverage_warnings"], [])
+
+    def test_stats_warns_and_normalizes_missing_attribution(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            log = Path(temporary_dir) / "runs.jsonl"
+            timestamp = module.datetime.now(module.UTC).isoformat()
+            record = {
+                "timestamp": timestamp,
+                "run_type": "native_v1_canary",
+                "status": "blocked",
+                "provider": None,
+                "role": None,
+                "duration_seconds": 0,
+                "usage": {},
+            }
+            log.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with patch.object(module, "RUN_LOG_PATH", log):
+                payload = module.stats(1)
+        self.assertIn("unknown", payload["by_provider"])
+        self.assertIn("unknown", payload["role_stats"])
+        self.assertEqual(len(payload["coverage_warnings"]), 1)
 
     def test_catalog_default_is_not_global_config(self):
         self.assertNotEqual(module.DEFAULT_CATALOG_PATH, module.CONFIG_PATH)
@@ -738,8 +820,9 @@ class RouterTests(unittest.TestCase):
                  patch.object(module, "CIRCUIT_LOCK_PATH", Path(circuit_dir) / "circuit.lock"):
                 payload = module.run_worker(args)
         self.assertEqual(invoke.call_count, 2)
-        self.assertIn("sensenova/deepseek-v4-flash", invoke.call_args_list[1].args[0])
-        self.assertEqual(payload["provider"], "sensenova")
+        fallback = module.RUNTIME_CONFIG["fallback"]["read_only"]
+        self.assertIn(f"{fallback[1]}/deepseek-v4-flash", invoke.call_args_list[1].args[0])
+        self.assertEqual(payload["provider"], fallback[1])
         self.assertIn("provider fallback was used after an earlier DeepSeek route failed", payload["risks"])
 
     def test_length_finish_retries_same_provider_once_with_output_limit(self):
