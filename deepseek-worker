@@ -27,7 +27,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.7"
+VERSION = "0.10.8"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -748,25 +748,55 @@ def opencode_stream_diagnostics(stdout: str) -> dict[str, Any]:
             saw_error_event = True
 
     failure: str | None = None
+    failure_category: str | None = None
     last_reason = finish_reasons[-1] if finish_reasons else None
     if saw_opencode_event:
         if saw_error_event:
             failure = "OpenCode emitted an error event"
+            failure_category = "opencode_error_event"
         elif not saw_step_finish:
             failure = "OpenCode stream ended without a step_finish event"
+            failure_category = "missing_step_finish"
         elif last_reason is None:
             failure = "OpenCode step_finish did not include a reason"
+            failure_category = "missing_finish_reason"
         elif last_reason in {"length", "error", "unknown", "other"}:
             failure = f"OpenCode stream ended with finish reason {last_reason}"
+            failure_category = f"finish_reason:{last_reason}"
         elif not saw_usable_text:
             failure = "OpenCode stream ended with zero usable text output"
+            failure_category = "zero_usable_text"
     return {
         "is_opencode": saw_opencode_event,
         "saw_step_finish": saw_step_finish,
         "finish_reason": last_reason,
         "has_usable_text": saw_usable_text,
         "failure": failure,
+        "failure_category": failure_category,
     }
+
+
+def attempt_failure_category(
+    completed: subprocess.CompletedProcess[str],
+    stream: dict[str, Any],
+    message: dict[str, Any] | None,
+    invalid_result: bool,
+    task_activity: bool,
+    declared_mismatch: bool,
+) -> str:
+    """Return a bounded, non-sensitive classification for an unaccepted attempt."""
+    if declared_mismatch:
+        return "declared_diff_mismatch"
+    category = stream.get("failure_category")
+    if isinstance(category, str):
+        return category
+    if invalid_result or message is None:
+        return "invalid_structured_result"
+    if not task_activity:
+        return "no_task_tool_activity"
+    if completed.returncode != 0:
+        return "process_nonzero_exit"
+    return "unclassified_attempt_failure"
 
 
 def parse_worker_events(stdout: str) -> tuple[dict[str, Any] | None, dict[str, int], bool, bool]:
@@ -1293,6 +1323,7 @@ def record_run(
         "stream_retry_count": payload.get("stream_retry_count", 0),
         "fallback_used": "provider fallback was used after an earlier DeepSeek route failed" in risks,
         "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
+        "attempt_failure_categories": list(payload.get("attempt_failure_categories") or []),
         "usage": payload.get("usage", {}),
     }
     RUN_LOG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1924,7 +1955,7 @@ def _run_worker_locked(
         try:
             lease_handle = provider_lease(provider)
         except WorkerError as exc:
-            attempts.append({"provider": provider, "error": str(exc)})
+            attempts.append({"provider": provider, "error": str(exc), "category": "provider_busy"})
             provider_busy = True
             if automatic:
                 continue
@@ -1964,9 +1995,13 @@ def _run_worker_locked(
                     accepted = True
                     break
                 attempt_label = provider if stream_retry_count == 0 else f"{provider} retry"
+                category = attempt_failure_category(
+                    completed, stream, message, invalid_result, task_activity, declared_mismatch
+                )
                 attempts.append(
                     {
                         "provider": attempt_label,
+                        "category": category,
                         "error": (
                             "declared files do not match the real workdir diff"
                             if declared_mismatch
@@ -1999,6 +2034,7 @@ def _run_worker_locked(
     duration = round(time.monotonic() - started, 2)
     after = workspace_snapshot(workdir)
     detected = changed_workspace_paths(before, after)
+    attempt_failure_categories = [str(item["category"]) for item in attempts if isinstance(item.get("category"), str)]
 
     if side_effect_attempt is not None and not accepted:
         payload = {
@@ -2017,6 +2053,7 @@ def _run_worker_locked(
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
     elif not accepted:
@@ -2033,6 +2070,7 @@ def _run_worker_locked(
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
     else:
@@ -2051,6 +2089,7 @@ def _run_worker_locked(
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
     if automatic and accepted:

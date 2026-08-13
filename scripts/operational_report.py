@@ -46,6 +46,7 @@ def read_rows(path: Path, cutoff: datetime) -> tuple[list[dict[str, Any]], int]:
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     statuses: dict[str, int] = defaultdict(int)
+    attempt_failure_categories: dict[str, int] = defaultdict(int)
     durations: list[float] = []
     success = fallback = partial = retried = blocked = 0
     for row in rows:
@@ -56,6 +57,11 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         fallback += int(bool(row.get("fallback_used")))
         partial += int(bool(row.get("partial_write")))
         retried += int(int(row.get("stream_retry_count") or 0) > 0)
+        categories = row.get("attempt_failure_categories")
+        if isinstance(categories, list):
+            for category in categories:
+                if isinstance(category, str) and category:
+                    attempt_failure_categories[category] += 1
         try:
             durations.append(float(row.get("duration_seconds") or 0))
         except (TypeError, ValueError):
@@ -71,6 +77,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "partial_write_runs": partial,
         "stream_retry_runs": retried,
         "blocked_runs": blocked,
+        "attempt_failure_category_counts": dict(sorted(attempt_failure_categories.items())),
     }
 
 

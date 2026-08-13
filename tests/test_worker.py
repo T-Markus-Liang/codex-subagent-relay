@@ -664,6 +664,25 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(module.opencode_stream_diagnostics(missing_finish)["failure"], "OpenCode stream ended without a step_finish event")
         self.assertEqual(module.opencode_stream_diagnostics(no_text)["failure"], "OpenCode stream ended with zero usable text output")
 
+    def test_opencode_stream_diagnostics_exposes_only_bounded_failure_categories(self):
+        error = json.dumps({"type": "error", "part": {}})
+        missing_finish = json.dumps({"type": "text", "part": {"text": "partial"}})
+        length = json.dumps({"type": "step_finish", "part": {"reason": "length"}})
+        self.assertEqual(module.opencode_stream_diagnostics(error)["failure_category"], "opencode_error_event")
+        self.assertEqual(module.opencode_stream_diagnostics(missing_finish)["failure_category"], "missing_step_finish")
+        self.assertEqual(module.opencode_stream_diagnostics(length)["failure_category"], "finish_reason:length")
+
+    def test_attempt_failure_category_prefers_safety_and_stream_classifications(self):
+        completed = module.subprocess.CompletedProcess([], 1, "", "raw sensitive error")
+        self.assertEqual(
+            module.attempt_failure_category(completed, {"failure_category": "opencode_error_event"}, None, True, False, False),
+            "opencode_error_event",
+        )
+        self.assertEqual(
+            module.attempt_failure_category(completed, {"failure_category": None}, None, True, False, True),
+            "declared_diff_mismatch",
+        )
+
     def test_native_contract_rejects_opening_prose(self):
         stdout = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "我会先检查目录。"}}) + "\n"
         result, invalid = module.native_result_contract(stdout)

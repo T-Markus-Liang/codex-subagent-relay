@@ -20,7 +20,7 @@ class OperationalReportTests(unittest.TestCase):
             path = Path(directory) / "runs.jsonl"
             rows = [
                 {"timestamp": "2026-08-13T00:00:00+00:00", "status": "success", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 10},
-                {"timestamp": "2026-08-13T01:00:00+00:00", "status": "error", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 20, "fallback_used": True, "stream_retry_count": 1},
+                {"timestamp": "2026-08-13T01:00:00+00:00", "status": "error", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 20, "fallback_used": True, "stream_retry_count": 1, "attempt_failure_categories": ["opencode_error_event", "invalid_structured_result"]},
                 {"timestamp": "2026-08-12T00:00:00+00:00", "status": "success", "provider": "sensenova1", "run_type": "native_v1_canary", "duration_seconds": 30},
             ]
             path.write_text("\n".join(json.dumps(row) for row in rows) + "\nnot-json\n", encoding="utf-8")
@@ -28,6 +28,7 @@ class OperationalReportTests(unittest.TestCase):
         self.assertEqual(payload["overall"]["runs"], 3)
         self.assertEqual(payload["overall"]["success_rate_percent"], 66.67)
         self.assertEqual(payload["providers"]["sensenova"]["fallback_runs"], 1)
+        self.assertEqual(payload["providers"]["sensenova"]["attempt_failure_category_counts"], {"invalid_structured_result": 1, "opencode_error_event": 1})
         self.assertEqual(payload["run_types"]["native_v1_canary"]["runs"], 1)
         self.assertEqual(payload["invalid_records_skipped"], 1)
         self.assertIn("Do not add", payload["coverage_warning"])
@@ -44,17 +45,17 @@ class OperationalReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runs.jsonl"
             rows = [
-                {"timestamp": "2026-08-13T00:00:00+00:00", "relay_version": "0.10.7", "telemetry_scope": "production", "status": "success", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 10},
+                {"timestamp": "2026-08-13T00:00:00+00:00", "relay_version": "0.10.8", "telemetry_scope": "production", "status": "success", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 10},
                 {"timestamp": "2026-08-13T01:00:00+00:00", "relay_version": "0.10.6", "telemetry_scope": "production", "status": "error", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 20},
-                {"timestamp": "2026-08-13T02:00:00+00:00", "relay_version": "0.10.7", "telemetry_scope": "diagnostic", "status": "success", "provider": "sensenova1", "run_type": "native_v1_canary", "duration_seconds": 30},
+                {"timestamp": "2026-08-13T02:00:00+00:00", "relay_version": "0.10.8", "telemetry_scope": "diagnostic", "status": "success", "provider": "sensenova1", "run_type": "native_v1_canary", "duration_seconds": 30},
                 {"timestamp": "2026-08-13T03:00:00+00:00", "status": "success", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 40},
             ]
             path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-            payload = module.report(path, 7, now, relay_version="0.10.7", run_type="external_run", telemetry_scope="production", since=datetime(2026, 8, 13, tzinfo=UTC))
+            payload = module.report(path, 7, now, relay_version="0.10.8", run_type="external_run", telemetry_scope="production", since=datetime(2026, 8, 13, tzinfo=UTC))
         self.assertEqual(payload["overall"]["runs"], 1)
         self.assertEqual(payload["source_rows_in_window"], 4)
         self.assertEqual(payload["rows_excluded_by_filters"], 3)
-        self.assertEqual(payload["filters"], {"relay_version": "0.10.7", "run_type": "external_run", "telemetry_scope": "production", "since": "2026-08-13T00:00:00+00:00"})
+        self.assertEqual(payload["filters"], {"relay_version": "0.10.8", "run_type": "external_run", "telemetry_scope": "production", "since": "2026-08-13T00:00:00+00:00"})
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.7.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.8.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -159,13 +159,13 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.7 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.8 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
 
 The report separates `external_run` from native canaries and groups success rate, P50/P95, fallback,
-retry, partial-write, and Provider-busy blocks by UTC day and Provider. Start a new qualifying
+retry, partial-write, Provider-busy blocks, and bounded attempt-failure categories by UTC day and Provider. Start a new qualifying
 seven-day window after a Relay/runtime/Provider-policy change; do not combine old versions, stress
 experiments, qualification retries, or canaries into a production SLO. The report does not include
 task text and must not be added to Codex Rollout or CC Switch token ledgers.

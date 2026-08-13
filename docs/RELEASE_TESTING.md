@@ -112,7 +112,7 @@ tasks share the Provider as qualification evidence.
 For a concurrency experiment, keep write tasks pointed at one workdir and verify all but one return `blocked`; use separate disposable workdirs for read-only parallelism. Record the exact concurrency level, start method, status counts, p50/p95 duration, stream failure reasons, fallback count, and partial-write count. Do not publish a concurrency guarantee beyond the highest fully observed level.
 
 Record only: timestamp, Worker version, run type, role, provider route, status, duration, stream finish
-reason, retry/fallback flags, and redacted aggregate usage. Do not publish prompts, workspace paths,
+reason, retry/fallback flags, bounded attempt-failure categories, and redacted aggregate usage. Do not publish prompts, workspace paths,
 request bodies, response bodies, thread ids, credentials, or raw logs.
 
 `deepseek-worker --json stats --hours 168` summarizes the local ledger with separate run types,
@@ -123,7 +123,7 @@ For the required seven-day operational observation, generate a source-local UTC 
 each day and preserve only the redacted aggregate report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.7 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.8 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
