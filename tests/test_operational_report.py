@@ -73,6 +73,11 @@ class OperationalReportTests(unittest.TestCase):
         self.assertEqual(usage["accepted_success_usage"]["request_tokens"], 23)
         self.assertEqual(usage["accepted_usage_coverage"], {"rows_with_field": 2, "rows_missing_field": 1, "note": "accepted_success_usage counts only the accepted final Provider attempt; it excludes failed and retried attempts."})
 
+    def test_future_since_is_rejected(self):
+        now = datetime(2026, 8, 14, tzinfo=UTC)
+        with self.assertRaisesRegex(ValueError, "since must not be later"):
+            module.report(Path("unused.jsonl"), 7, now, since=datetime(2026, 8, 15, tzinfo=UTC))
+
 
 if __name__ == "__main__":
     unittest.main()

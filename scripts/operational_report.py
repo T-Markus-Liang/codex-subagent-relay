@@ -125,6 +125,8 @@ def report(
     if not 0 < days <= 365:
         raise ValueError("days must be between 0 and 365")
     now = now or datetime.now(UTC)
+    if since is not None and since > now:
+        raise ValueError("since must not be later than the report end time")
     cutoff = max(now - timedelta(days=days), since) if since else now - timedelta(days=days)
     rows, invalid = read_rows(log_path, cutoff)
     source_rows = len(rows)
