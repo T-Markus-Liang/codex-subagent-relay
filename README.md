@@ -21,6 +21,19 @@ It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, Ope
 
 It does **not** provision Provider accounts, API keys, OpenCode, Codex profiles, local bridges, or a third-party Provider. This is a local relay around an already-working integration.
 
+## Native Agent Team Status
+
+Native Codex Agent Team remains a research backend, not a production execution path. The Relay
+includes `native-role-bisection`, which runs `builtin`, `minimal`, `model-only`, `provider-only`,
+and full-role V1 canaries in a disposable `CODEX_HOME`. It never changes the live Codex provider,
+conversation history, or state database.
+
+On Desktop Codex `0.147.0-alpha.6.5`, the current bisection is blocked at the `builtin` layer:
+the parent emits `spawn_agent` but does not wait for a real child result, bridge completion, or
+isolated child Provider metadata. This is a parent-child lifecycle failure before third-party
+Provider routing, so changing role TOML or Provider aliases is not a production fix. Continue to
+use external `launch -> poll` until native end-to-end qualification independently passes.
+
 ## Job Lifecycle
 
 `launch` creates a private durable job directory under `~/.codex/deepseek-worker-jobs/<job-id>/`.

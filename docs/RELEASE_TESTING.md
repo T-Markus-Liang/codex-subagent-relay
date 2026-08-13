@@ -149,3 +149,11 @@ hide an upstream reliability problem.
 ## Evidence Boundary
 
 The CI badge proves only the offline gate for its referenced commit. It does not prove third-party Provider availability, latency, tool quality, quota, or success rate. Native V1/V2 Agent Team paths remain experimental and must be reported separately from external Worker `run`/`launch` results.
+
+## Current Native Finding
+
+The current Desktop Codex `0.147.0-alpha.6.5` V1 role bisection is blocked at the first `builtin`
+layer. It records a `spawn_agent` tool call but no parent wait, no direct child result, no Provider
+bridge completion, and no isolated child metadata. This localizes the failure to native Agent Team
+parent-child lifecycle before role overrides or third-party Provider selection. It is negative
+research evidence, not a reason to lower the native contract or to promote the native backend.

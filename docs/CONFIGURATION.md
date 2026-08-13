@@ -60,6 +60,19 @@ deepseek-worker --json smoke-test --provider sensenova --workdir /tmp/codex-suba
 
 That command consumes Provider quota. Delete the disposable directory when finished.
 
+## Native Research Boundary
+
+The external Relay is the production executor. `native-v1-canary`, `native-role-bisection`, and
+`cliproxy-native-canary` are isolated diagnostics only. They create a temporary `CODEX_HOME` and
+must leave the root `model_provider`, conversation database, and rollout history unchanged.
+
+`native-role-bisection` starts with a built-in role, then adds only one role layer at a time. A
+failure in `builtin` means Codex Agent Team registration or parent-child lifecycle failed before a
+role file or third-party Provider could be responsible. A passing `spawn_agent` call alone is not
+success: the gate also requires an actual parent wait, direct child JSON with its random nonce,
+bridge completion, and isolated child Provider/model/role metadata. Do not use native routing for
+production until its separate qualification gate passes.
+
 ## Environment Variables
 
 | Variable | Purpose | Default |
