@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+!.env.example
+reports/
+*.sqlite
+*.sqlite-*
+*.jsonl
+deepseek-worker-jobs/
+deepseek-worker-locks/

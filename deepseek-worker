@@ -1,0 +1,2093 @@
+#!/usr/bin/env python3
+"""Run bounded execution tasks through the configured DeepSeek Codex profiles."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import fcntl
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import tomllib
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+
+VERSION = "0.7.1"
+MAX_TASK_BYTES = 256 * 1024
+ROOT = Path(__file__).resolve().parent
+SCHEMA_PATH = ROOT / "schemas/result.schema.json"
+CODEX_HOME = Path.home() / ".codex"
+CONFIG_PATH = CODEX_HOME / "config.toml"
+RUN_LOG_PATH = CODEX_HOME / "deepseek-worker-runs.jsonl"
+JOB_ROOT = CODEX_HOME / "deepseek-worker-jobs"
+MAX_FALLBACK_SNAPSHOT_FILES = 10000
+DEFAULT_CATALOG_PATH = CODEX_HOME / "deepseek-subagent-model-catalog.json"
+NATIVE_TEST_PROFILE = "ds-native-catalog-test"
+BRIDGE_LOG_PATH = Path.home() / ".proxy-watchdog/deepseek-codex-bridge.log"
+DESKTOP_CODEX_PATH = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+OPENCODE_PATH = Path.home() / ".opencode/bin/opencode"
+CLIPROXY_CANARY_URL = os.environ.get("DEEPSEEK_WORKER_CLIPROXY_URL", "http://127.0.0.1:18317/v1")
+CLIPROXY_CANARY_KEY = os.environ.get("DEEPSEEK_WORKER_CLIPROXY_TOKEN", "codex-native-canary-local-only")
+CLIPROXY_ALIAS = os.environ.get("DEEPSEEK_WORKER_CLIPROXY_ALIAS", "gpt-5.6-luna")
+CLIPROXY_CANARY_LOG_PATH = Path(
+    os.environ.get(
+        "DEEPSEEK_WORKER_CLIPROXY_LOG_PATH",
+        str(Path.home() / ".local/state/cliproxyapi-native-canary/auth/logs/main.log"),
+    )
+)
+DEFAULT_READ_TIMEOUT = 75
+DEFAULT_WRITE_TIMEOUT = 120
+DEFAULT_GENERAL_TIMEOUT = 120
+
+PROVIDERS = {
+    "sensenova": {"profile": "ds-sensenova", "port": 15741, "model": "sensenova/deepseek-v4-flash"},
+    "sensenova1": {"profile": "ds-sensenova1", "port": 15742, "model": "sensenova1/deepseek-v4-flash"},
+    "opencode-go": {"profile": "ds-opencode-go", "port": 15743, "model": "opencode-go/deepseek-v4-flash"},
+}
+
+READ_ONLY_ROLES = {
+    "search",
+    "repository-exploration",
+    "exploration",
+    "logs",
+    "log-analysis",
+}
+WORKER_ROLES = {
+    "implementation",
+    "test",
+    "testing",
+    "debug",
+    "refactor",
+    "documentation",
+    "docs",
+}
+SOL_ROLES = {"architecture", "planning", "complex-decision", "decision", "final-review"}
+TERRA_ROLES = {"review", "validation", "second-opinion"}
+
+
+class WorkerError(RuntimeError):
+    pass
+
+
+def emit(payload: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return
+    status = payload.get("status", "unknown")
+    summary = payload.get("summary") or payload.get("reason") or ""
+    print(f"status: {status}")
+    if summary:
+        print(summary)
+
+
+def redact(text: str, limit: int = 1200) -> str:
+    compact = " ".join(text.strip().split())
+    for marker in ("Bearer ", "sk-", "api_key=", "api-key="):
+        pos = compact.lower().find(marker.lower())
+        if pos >= 0:
+            compact = compact[:pos] + "[REDACTED]"
+            break
+    return compact[-limit:]
+
+
+def load_task(task: str | None, task_file: str | None) -> str:
+    if bool(task) == bool(task_file):
+        raise WorkerError("provide exactly one of --task or --task-file")
+    if task_file:
+        path = Path(task_file).expanduser().resolve()
+        if not path.is_file():
+            raise WorkerError(f"task file not found: {path}")
+        if path.stat().st_size > MAX_TASK_BYTES:
+            raise WorkerError(f"task file exceeds {MAX_TASK_BYTES} bytes")
+        value = path.read_text(encoding="utf-8")
+    else:
+        value = task or ""
+    if not value.strip():
+        raise WorkerError("task is empty")
+    return value.strip()
+
+
+def normalize_role(role: str, task: str = "") -> str:
+    value = role.strip().lower().replace("_", "-")
+    if value != "auto":
+        return value
+    lowered = task.lower()
+    keyword_groups = [
+        (SOL_ROLES, ("architecture", "architect", "规划", "架构", "最终 review", "final review")),
+        (TERRA_ROLES, ("second opinion", "validation", "review", "复核", "验证", "审查")),
+        (READ_ONLY_ROLES, ("grep", "search", "explore", "日志分析", "代码搜索", "仓库探索")),
+        (WORKER_ROLES, ("implement", "test", "debug", "refactor", "document", "实现", "测试", "调试", "重构", "文档")),
+    ]
+    for roles, keywords in keyword_groups:
+        if any(word in lowered for word in keywords):
+            return sorted(roles)[0]
+    return "implementation"
+
+
+def route(role: str, task: str = "") -> dict[str, Any]:
+    normalized = normalize_role(role, task)
+    if normalized in SOL_ROLES:
+        return {"target": "sol", "role": normalized, "reason": "architecture_or_final_decision"}
+    if normalized in TERRA_ROLES:
+        return {"target": "terra", "role": normalized, "reason": "review_or_validation"}
+    if normalized in READ_ONLY_ROLES:
+        return {
+            "target": "deepseek",
+            "role": normalized,
+            "provider": "sensenova",
+            "profile": PROVIDERS["sensenova"]["profile"],
+            "sandbox": "read-only",
+            "reason": "read_heavy_execution",
+        }
+    if normalized in WORKER_ROLES:
+        return {
+            "target": "deepseek",
+            "role": normalized,
+            "provider": "sensenova1",
+            "profile": PROVIDERS["sensenova1"]["profile"],
+            "sandbox": "workspace-write",
+            "reason": "execution_task",
+        }
+    return {
+        "target": "deepseek",
+        "role": normalized,
+        "provider": "sensenova1",
+        "profile": PROVIDERS["sensenova1"]["profile"],
+        "sandbox": "workspace-write",
+        "reason": "general_execution",
+    }
+
+
+def workspace_snapshot(workdir: Path) -> dict[str, str]:
+    """Fingerprint every dirty or untracked path, including files already dirty before a run."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workdir), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return filesystem_snapshot(workdir)
+    records = result.stdout.split(b"\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if len(record) < 4:
+            continue
+        status = record[:2]
+        paths.append(os.fsdecode(record[3:]))
+        if b"R" in status or b"C" in status:
+            index += 1
+
+    snapshot: dict[str, str] = {}
+    for relative in paths:
+        path = workdir / relative
+        try:
+            if path.is_symlink():
+                snapshot[relative] = f"symlink:{os.readlink(path)}"
+            elif path.is_file():
+                snapshot[relative] = str(file_fingerprint(path)["sha256"])
+            elif path.exists():
+                snapshot[relative] = "other"
+            else:
+                snapshot[relative] = "deleted"
+        except OSError:
+            snapshot[relative] = "unreadable"
+    return snapshot
+
+
+def filesystem_snapshot(workdir: Path) -> dict[str, str]:
+    """Bounded fallback for temporary/non-Git workdirs used by smoke tasks."""
+    snapshot: dict[str, str] = {}
+    skipped_dirs = {".git", ".venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}
+    for root, directories, files in os.walk(workdir):
+        directories[:] = [name for name in directories if name not in skipped_dirs and not name.startswith(".")]
+        for name in files:
+            path = Path(root) / name
+            try:
+                relative = str(path.relative_to(workdir))
+                if path.is_symlink():
+                    snapshot[relative] = f"symlink:{os.readlink(path)}"
+                elif path.is_file():
+                    snapshot[relative] = str(file_fingerprint(path)["sha256"])
+                if len(snapshot) > MAX_FALLBACK_SNAPSHOT_FILES:
+                    return {}
+            except OSError:
+                snapshot[str(path.relative_to(workdir))] = "unreadable"
+    return snapshot
+
+
+def workdir_lock(workdir: Path):
+    """Serialize write workers targeting the same repository without blocking reads."""
+    lock_key = hashlib.sha256(str(workdir).encode("utf-8")).hexdigest()[:24]
+    lock_path = CODEX_HOME / "deepseek-worker-locks" / f"{lock_key}.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise WorkerError("another write worker is already active for this workdir") from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({"workdir": str(workdir), "pid": os.getpid()}, separators=(",", ":")))
+    handle.flush()
+    return handle
+
+
+def changed_workspace_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    return sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+
+
+def build_provider_order(role: str, selected_provider: str, automatic: bool) -> list[str]:
+    """Keep fallback traffic aligned with the task's read/write characteristics."""
+    if not automatic:
+        return [selected_provider]
+    normalized = normalize_role(role)
+    if normalized in READ_ONLY_ROLES:
+        preferred = ("sensenova", "sensenova1")
+    elif normalized in WORKER_ROLES:
+        preferred = ("sensenova1", "sensenova")
+    else:
+        preferred = ("sensenova1", "sensenova")
+    return [selected_provider, *(name for name in preferred if name != selected_provider)]
+
+
+def provider_timeouts(total_timeout: int, attempts: int) -> list[int]:
+    """Give the preferred route enough time to finish before bounded fallbacks."""
+    total = max(30, int(total_timeout))
+    if attempts <= 1:
+        return [total]
+    if total < 60:
+        base, remainder = divmod(total, attempts)
+        return [base + (1 if index < remainder else 0) for index in range(attempts)]
+    reserve = min(45, max(20, total // 4))
+    first = total - reserve
+    fallback, remainder = divmod(reserve, attempts - 1)
+    return [first, *(fallback + (1 if index < remainder else 0) for index in range(attempts - 1))]
+
+
+def effective_timeout(requested_timeout: int, role: str) -> int:
+    """Use short role-aware defaults unless a caller explicitly supplies a positive budget."""
+    if requested_timeout > 0:
+        return max(30, int(requested_timeout))
+    normalized = normalize_role(role)
+    if normalized in READ_ONLY_ROLES:
+        return DEFAULT_READ_TIMEOUT
+    if normalized in WORKER_ROLES:
+        return DEFAULT_WRITE_TIMEOUT
+    return DEFAULT_GENERAL_TIMEOUT
+
+
+def worker_prompt(task: str, role: str) -> str:
+    return f"""You are a bounded DeepSeek execution worker.
+
+Role: {role}
+
+Complete the task in the current work directory. Keep exploration, grep output, build logs,
+stack traces, and intermediate debugging in this worker context. Do not return raw logs.
+Make only task-scoped changes. Run proportionate validation.
+Start with an ordinary shell or file tool and keep the final few turns for the required JSON
+result. Do not spend the task budget narrating a plan, discovering plugins, or printing logs.
+A response without recorded task-tool activity is invalid, even if its JSON is well formed.
+
+You are the final execution worker for this task, not a planner. Do not delegate or invoke
+deepseek-worker, opencode, codex exec, spawn_agent, followup_task, or any other agent runner.
+Use only ordinary task-scoped file and shell tools allowed by the task.
+
+Your final response must be exactly one JSON object with no Markdown fence or surrounding prose:
+{{"status":"success","summary":"concise result","files_changed":[],"tests":[],"risks":[]}}
+The only allowed status values are success, partial, blocked, or error. Keep summary concise. List
+only files actually changed. The files_changed, tests, and risks fields must each be JSON arrays of
+strings. Use [] when a list is empty; never use 0, null, or the string "none" for these fields. Put
+test command outcomes in tests and unresolved concerns in risks.
+
+Task:
+{task}
+"""
+
+
+STATUS_ALIASES = {
+    "success": "success",
+    "succeeded": "success",
+    "complete": "success",
+    "completed": "success",
+    "done": "success",
+    "ok": "success",
+    "partial": "partial",
+    "incomplete": "partial",
+    "blocked": "blocked",
+    "error": "error",
+    "failed": "error",
+    "failure": "error",
+}
+
+
+def normalize_result(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or set(payload) != {"status", "summary", "files_changed", "tests", "risks"}:
+        return None
+    status = payload.get("status")
+    if not isinstance(status, str) or STATUS_ALIASES.get(status.strip().lower()) is None:
+        return None
+    if not isinstance(payload["summary"], str) or len(payload["summary"]) > 4000:
+        return None
+    normalized_lists: dict[str, list[str]] = {}
+    for field in ("files_changed", "tests", "risks"):
+        value = payload[field]
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            normalized_lists[field] = value
+        elif field == "files_changed" and isinstance(value, int) and not isinstance(value, bool) and value == 0:
+            normalized_lists[field] = []
+        elif field in {"tests", "risks"} and isinstance(value, str) and value.strip().lower() == "none":
+            normalized_lists[field] = []
+        else:
+            return None
+    return {
+        **payload,
+        **normalized_lists,
+        "status": STATUS_ALIASES[status.strip().lower()],
+    }
+
+
+def is_valid_result(payload: Any) -> bool:
+    return normalize_result(payload) is not None
+
+
+def parse_result_text(text: str) -> dict[str, Any] | None:
+    """Extract the last valid result object from exact, fenced, or prose-wrapped JSON."""
+    decoder = json.JSONDecoder()
+    candidates: list[Any] = []
+    stripped = text.strip()
+    try:
+        candidates.append(json.loads(stripped))
+    except json.JSONDecodeError:
+        for offset, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                candidate, _end = decoder.raw_decode(text, offset)
+            except json.JSONDecodeError:
+                continue
+            candidates.append(candidate)
+    for candidate in reversed(candidates):
+        normalized = normalize_result(candidate)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def parse_codex_events(stdout: str) -> tuple[dict[str, Any] | None, dict[str, int], bool]:
+    message: dict[str, Any] | None = None
+    usage: dict[str, int] = {}
+    saw_agent_message = False
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str):
+                    saw_agent_message = True
+                    parsed = parse_result_text(text)
+                    if parsed is not None:
+                        message = parsed
+        elif event.get("type") == "turn.completed":
+            raw_usage = event.get("usage") or {}
+            usage = {key: int(value) for key, value in raw_usage.items() if isinstance(value, int)}
+    return message, usage, saw_agent_message and message is None
+
+
+def has_task_activity(stdout: str) -> bool:
+    task_item_types = {"command_execution", "file_change", "mcp_tool_call", "web_search"}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") not in {"item.started", "item.completed"}:
+            continue
+        item = event.get("item") or {}
+        if item.get("type") in task_item_types:
+            return True
+    return False
+
+
+def parse_opencode_events(stdout: str) -> tuple[dict[str, Any] | None, dict[str, int], bool, bool]:
+    texts: list[str] = []
+    usage = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    task_activity = False
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        part = event.get("part") or {}
+        if event_type == "text" and isinstance(part.get("text"), str):
+            texts.append(part["text"])
+        elif event_type == "tool_use":
+            state = part.get("state") or {}
+            if state.get("status") in {"completed", "running"}:
+                task_activity = True
+        elif event_type == "step_finish":
+            tokens = part.get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            usage["input_tokens"] += int(tokens.get("input") or 0)
+            usage["cached_input_tokens"] += int(cache.get("read") or 0)
+            usage["cache_write_input_tokens"] += int(cache.get("write") or 0)
+            usage["output_tokens"] += int(tokens.get("output") or 0)
+            usage["reasoning_output_tokens"] += int(tokens.get("reasoning") or 0)
+    message = parse_result_text("\n".join(texts)) if texts else None
+    return message, usage, bool(texts) and message is None, task_activity
+
+
+def opencode_stream_diagnostics(stdout: str) -> dict[str, Any]:
+    """Classify OpenCode's terminal stream without retaining model text or raw errors."""
+    saw_opencode_event = False
+    saw_step_finish = False
+    saw_usable_text = False
+    finish_reasons: list[str] = []
+    saw_error_event = False
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        if event_type not in {"step_start", "step_finish", "tool_use", "text", "error"}:
+            continue
+        saw_opencode_event = True
+        part = event.get("part") or {}
+        if event_type == "text" and isinstance(part.get("text"), str) and part["text"].strip():
+            saw_usable_text = True
+        elif event_type == "step_finish":
+            saw_step_finish = True
+            reason = part.get("reason") or part.get("finishReason") or event.get("reason") or event.get("finishReason")
+            if isinstance(reason, str) and reason.strip():
+                finish_reasons.append(reason.strip().lower().replace("_", "-"))
+        elif event_type == "error":
+            saw_error_event = True
+
+    failure: str | None = None
+    last_reason = finish_reasons[-1] if finish_reasons else None
+    if saw_opencode_event:
+        if saw_error_event:
+            failure = "OpenCode emitted an error event"
+        elif not saw_step_finish:
+            failure = "OpenCode stream ended without a step_finish event"
+        elif last_reason is None:
+            failure = "OpenCode step_finish did not include a reason"
+        elif last_reason in {"length", "error", "unknown", "other"}:
+            failure = f"OpenCode stream ended with finish reason {last_reason}"
+        elif not saw_usable_text:
+            failure = "OpenCode stream ended with zero usable text output"
+    return {
+        "is_opencode": saw_opencode_event,
+        "saw_step_finish": saw_step_finish,
+        "finish_reason": last_reason,
+        "has_usable_text": saw_usable_text,
+        "failure": failure,
+    }
+
+
+def parse_worker_events(stdout: str) -> tuple[dict[str, Any] | None, dict[str, int], bool, bool]:
+    for line in stdout.splitlines():
+        try:
+            event_type = json.loads(line).get("type")
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if event_type in {"step_start", "step_finish", "tool_use", "text"}:
+            return parse_opencode_events(stdout)
+    message, usage, invalid = parse_codex_events(stdout)
+    return message, usage, invalid, has_task_activity(stdout)
+
+
+def native_result_contract(stdout: str) -> tuple[dict[str, Any] | None, bool]:
+    """Return the parent-visible final native-agent contract and invalid-message flag."""
+    result, _usage, invalid_result = parse_codex_events(stdout)
+    return result, invalid_result
+
+
+def desktop_codex_binary() -> Path:
+    if DESKTOP_CODEX_PATH.is_file() and os.access(DESKTOP_CODEX_PATH, os.X_OK):
+        return DESKTOP_CODEX_PATH
+    fallback = shutil.which("codex")
+    if fallback:
+        return Path(fallback).resolve()
+    raise WorkerError("Codex Desktop binary not found")
+
+
+def file_fingerprint(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": digest.hexdigest()}
+
+
+def state_db_snapshot() -> dict[str, dict[str, Any]]:
+    return {str(path): file_fingerprint(path) for path in sorted(CODEX_HOME.glob("state_*.sqlite")) if path.is_file()}
+
+
+def write_native_canary_config(source: Path, destination: Path, agent_provider: str) -> None:
+    """Write only the parent and child Provider settings needed by the isolated Desktop canary."""
+    try:
+        config_text = source.read_text(encoding="utf-8")
+        config = tomllib.loads(config_text)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkerError(f"cannot read native canary config: {type(exc).__name__}") from exc
+    providers = config.get("model_providers") or {}
+    parent_provider = providers.get("openai-chatgpt") or {}
+    child_provider = providers.get(agent_provider) or {}
+    parent_required = ("name", "base_url", "wire_api", "requires_openai_auth", "experimental_bearer_token")
+    child_required = ("name", "base_url", "wire_api")
+    if not all(key in parent_provider for key in parent_required):
+        raise WorkerError("native canary requires complete openai-chatgpt Provider settings")
+    if not all(key in child_provider for key in child_required):
+        raise WorkerError(f"native canary requires complete {agent_provider} Provider settings")
+    rendered = [
+        'model_provider = "openai-chatgpt"\n',
+        "\n",
+        "[agents]\n",
+        "enabled = true\n",
+        "\n",
+        "[model_providers.openai-chatgpt]\n",
+    ]
+    for key in parent_required:
+        value = parent_provider[key]
+        if not isinstance(value, (bool, str)):
+            raise WorkerError(f"unsupported native canary Provider value: {key}")
+        rendered.append(f"{key} = {'true' if value else 'false'}\n" if isinstance(value, bool) else f"{key} = {json.dumps(value, ensure_ascii=False)}\n")
+    rendered.extend(["\n", f"[model_providers.{agent_provider}]\n"])
+    for key in child_required:
+        value = child_provider[key]
+        if not isinstance(value, (bool, str)):
+            raise WorkerError(f"unsupported native canary Provider value: {key}")
+        rendered.append(f"{key} = {'true' if value else 'false'}\n" if isinstance(value, bool) else f"{key} = {json.dumps(value, ensure_ascii=False)}\n")
+    filtered_text = "".join(rendered)
+    try:
+        tomllib.loads(filtered_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise WorkerError("native canary config became invalid after compatibility filtering") from exc
+    destination.write_text(filtered_text, encoding="utf-8")
+    os.chmod(destination, 0o600)
+
+
+def build_v1_canary_catalog(source: Path, output: Path, parent_model: str) -> None:
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        models = payload["models"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise WorkerError("cannot read the configured Codex model catalog") from exc
+    if not isinstance(models, list):
+        raise WorkerError("configured Codex model catalog has an unsupported shape")
+    parent_found = deepseek_found = False
+    rendered_models: list[dict[str, Any]] = []
+    for raw_model in models:
+        if not isinstance(raw_model, dict):
+            continue
+        model = copy.deepcopy(raw_model)
+        if model.get("slug") == parent_model:
+            model["multi_agent_version"] = "v1"
+            parent_found = True
+        if model.get("slug") == "deepseek-v4-flash":
+            deepseek_found = True
+        rendered_models.append(model)
+    if not parent_found:
+        raise WorkerError(f"parent model not found in configured catalog: {parent_model}")
+    if not deepseek_found:
+        raise WorkerError("deepseek-v4-flash not found in configured catalog")
+    payload["models"] = rendered_models
+    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(output, 0o600)
+
+
+def build_cliproxy_canary_catalog(source: Path, output: Path, parent_model: str) -> None:
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        models = payload["models"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise WorkerError("cannot read the configured Codex model catalog") from exc
+    if not isinstance(models, list):
+        raise WorkerError("configured Codex model catalog has an unsupported shape")
+    parent_found = alias_found = False
+    for raw_model in models:
+        if not isinstance(raw_model, dict):
+            continue
+        if raw_model.get("slug") == parent_model:
+            raw_model["multi_agent_version"] = "v2"
+            parent_found = True
+        if raw_model.get("slug") == CLIPROXY_ALIAS:
+            raw_model["multi_agent_version"] = "v2"
+            raw_model["use_responses_lite"] = False
+            raw_model.pop("tool_mode", None)
+            alias_found = True
+    if not parent_found:
+        raise WorkerError(f"parent model not found in configured catalog: {parent_model}")
+    if not alias_found:
+        raise WorkerError(f"CLIProxyAPI alias not found in configured catalog: {CLIPROXY_ALIAS}")
+    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(output, 0o600)
+
+
+def native_v1_child_result(stdout: str, nonce: str) -> tuple[dict[str, Any] | None, str | None, bool, bool, bool]:
+    spawned = waited = False
+    child_result: dict[str, Any] | None = None
+    child_ids: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item") or {}
+        if item.get("type") != "collab_tool_call":
+            continue
+        if item.get("tool") == "spawn_agent":
+            child_ids.extend(str(value) for value in (item.get("receiver_thread_ids") or []))
+            spawned = len(child_ids) == 1 and item.get("status") == "completed"
+            continue
+        if item.get("tool") != "wait":
+            continue
+        waited = item.get("status") == "completed"
+        states = item.get("agents_states") or {}
+        if isinstance(states, dict):
+            child_ids.extend(str(value) for value in states if str(value) not in child_ids)
+        candidates = states.values() if isinstance(states, dict) else states if isinstance(states, list) else []
+        for state in candidates:
+            if not isinstance(state, dict):
+                continue
+            message = state.get("message")
+            if isinstance(message, dict):
+                parsed = message
+            elif isinstance(message, str):
+                try:
+                    parsed = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                continue
+            if is_valid_result(parsed):
+                child_result = parsed
+    expected_summaries = {f"native-v1-canary:{nonce}", f"cliproxy-native-canary:{nonce}"}
+    nonce_verified = bool(child_result and child_result.get("summary") in expected_summaries)
+    child_id = child_ids[0] if len(child_ids) == 1 else None
+    spawned = spawned or bool(waited and child_id)
+    return child_result, child_id, spawned, waited, nonce_verified
+
+
+def native_event_diagnostics(stdout: str) -> dict[str, Any]:
+    item_types: set[str] = set()
+    collab_tools: set[str] = set()
+    parent_message = ""
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") or {}
+        item_type = item.get("type")
+        if isinstance(item_type, str):
+            item_types.add(item_type)
+        if item_type == "collab_tool_call" and isinstance(item.get("tool"), str):
+            collab_tools.add(item["tool"])
+        if item_type == "agent_message" and isinstance(item.get("text"), str):
+            parent_message = redact(item["text"], 300)
+    return {
+        "item_types": sorted(item_types),
+        "collab_tools": sorted(collab_tools),
+        "parent_message": parent_message,
+    }
+
+
+def child_rollout_evidence(
+    codex_home: Path,
+    child_id: str | None,
+    nonce: str,
+    rollout_path: Path | None = None,
+    expected_summary: str | None = None,
+    expected_outputs: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    evidence = {
+        "rollout_found": False,
+        "task_payload_present": False,
+        "tool_calls": [],
+        "tool_outputs": 0,
+        "expected_outputs_verified": False,
+        "parallel_tool_calls_observed": False,
+        "final_result": None,
+        "final_result_valid": False,
+        "final_result_nonce_verified": False,
+    }
+    if not child_id and rollout_path is None:
+        return evidence
+    rollout = rollout_path
+    if rollout is None:
+        for candidate in codex_home.rglob("rollout-*.jsonl"):
+            if child_id and child_id in candidate.name:
+                rollout = candidate
+                break
+    if rollout is None:
+        return evidence
+    try:
+        rollout.resolve().relative_to(codex_home.resolve())
+    except (OSError, ValueError):
+        return evidence
+    evidence["rollout_found"] = True
+    consecutive_calls = 0
+    max_consecutive_calls = 0
+    tool_calls: list[str] = []
+    final_result: dict[str, Any] | None = None
+    observed_outputs: list[str] = []
+    try:
+        lines = rollout.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return evidence
+    for line in lines:
+        if nonce in line:
+            evidence["task_payload_present"] = True
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = event.get("payload") or {}
+        if event.get("type") != "response_item" or not isinstance(payload, dict):
+            continue
+        item_type = payload.get("type")
+        if item_type == "function_call":
+            name = str(payload.get("name") or "")
+            if name:
+                tool_calls.append(name)
+            consecutive_calls += 1
+            max_consecutive_calls = max(max_consecutive_calls, consecutive_calls)
+        elif item_type == "function_call_output":
+            evidence["tool_outputs"] += 1
+            output = payload.get("output")
+            if isinstance(output, str):
+                observed_outputs.append(output)
+            consecutive_calls = 0
+        elif item_type == "message" and payload.get("role") == "assistant":
+            content = payload.get("content") or []
+            text = "\n".join(
+                str(part.get("text"))
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str)
+            )
+            parsed = parse_result_text(text)
+            if parsed is not None:
+                final_result = parsed
+        elif item_type not in {"reasoning", "message"}:
+            consecutive_calls = 0
+    evidence["tool_calls"] = tool_calls
+    evidence["expected_outputs_verified"] = bool(expected_outputs) and all(
+        any(expected in output for output in observed_outputs) for expected in expected_outputs
+    )
+    evidence["parallel_tool_calls_observed"] = max_consecutive_calls >= 2
+    evidence["final_result"] = final_result
+    evidence["final_result_valid"] = final_result is not None
+    expected_summary = expected_summary or f"cliproxy-native-canary:{nonce}"
+    evidence["final_result_nonce_verified"] = bool(final_result and final_result.get("summary") == expected_summary)
+    return evidence
+
+
+def find_isolated_native_child(
+    codex_home: Path,
+    provider: str,
+    model: str,
+    agent_role: str,
+    created_after_ms: int,
+    nonce: str,
+) -> dict[str, Any]:
+    """Resolve one V2 child from isolated state when JSON events omit its thread id."""
+    matches: list[dict[str, Any]] = []
+    for state_db in sorted(codex_home.glob("state_*.sqlite"), key=lambda path: path.stat().st_mtime_ns, reverse=True):
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(f"{state_db.resolve().as_uri()}?mode=ro", uri=True, timeout=0.1)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+            required = {"id", "rollout_path", "model_provider", "model", "agent_role", "created_at", "created_at_ms"}
+            if not required.issubset(columns):
+                continue
+            rows = connection.execute(
+                """SELECT id, rollout_path, model_provider, model, reasoning_effort, agent_role,
+                          COALESCE(created_at_ms, created_at * 1000)
+                   FROM threads
+                   WHERE model_provider = ? AND model = ? AND lower(agent_role) = lower(?)
+                     AND COALESCE(created_at_ms, created_at * 1000) >= ?""",
+                (provider, model, agent_role, created_after_ms),
+            ).fetchall()
+            for row in rows:
+                rollout = Path(str(row[1]))
+                try:
+                    rollout.resolve().relative_to(codex_home.resolve())
+                    contains_nonce = rollout.is_file() and nonce in rollout.read_text(encoding="utf-8")
+                except (OSError, ValueError, UnicodeError):
+                    contains_nonce = False
+                if contains_nonce:
+                    matches.append(
+                        {
+                            "id": str(row[0]),
+                            "rollout_path": rollout,
+                            "model_provider": row[2],
+                            "model": row[3],
+                            "reasoning_effort": row[4],
+                            "agent_role": row[5],
+                            "created_at_ms": row[6],
+                        }
+                    )
+        except (OSError, sqlite3.Error):
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+    unique_matches = {match["id"]: match for match in matches}
+    if len(unique_matches) != 1:
+        return {"child": None, "candidate_count": len(unique_matches)}
+    return {"child": next(iter(unique_matches.values())), "candidate_count": 1}
+
+
+def bridge_provider_completed(path: Path, offset: int, provider: str) -> bool:
+    if not path.is_file() or path.stat().st_size < offset:
+        return False
+    marker = f"completed backend={provider}".encode()
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        return any(marker in line for line in handle)
+
+
+def native_child_metadata(codex_home: Path, child_id: str | None) -> dict[str, Any] | None:
+    if not child_id:
+        return None
+    for state_db in sorted(codex_home.glob("state_*.sqlite"), key=lambda path: path.stat().st_mtime_ns, reverse=True):
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(f"{state_db.resolve().as_uri()}?mode=ro", uri=True, timeout=0.1)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+            required = {"id", "model_provider", "model", "reasoning_effort", "agent_role"}
+            if not required.issubset(columns):
+                continue
+            row = connection.execute(
+                "SELECT model_provider, model, reasoning_effort, agent_role FROM threads WHERE id = ?",
+                (child_id,),
+            ).fetchone()
+            if row:
+                return {
+                    "model_provider": row[0],
+                    "model": row[1],
+                    "reasoning_effort": row[2],
+                    "agent_role": row[3],
+                }
+        except (OSError, sqlite3.Error):
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+    return None
+
+
+def native_v1_command(codex: Path, catalog: Path, parent_model: str, prompt: str) -> list[str]:
+    return [
+        str(codex),
+        "--strict-config",
+        "-c",
+        f'model_catalog_json="{catalog}"',
+        "-c",
+        'model_provider="openai-chatgpt"',
+        "-c",
+        f'model="{parent_model}"',
+        "-c",
+        "features.multi_agent=true",
+        "-c",
+        "features.multi_agent_v2=false",
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--json",
+        prompt,
+    ]
+
+
+def invoke_codex(
+    command: list[str],
+    workdir: Path,
+    timeout: int,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=workdir,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        return subprocess.CompletedProcess(command, 124, stdout, stderr + f"\nworker timed out after {timeout} seconds")
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def record_run(payload: dict[str, Any]) -> None:
+    record = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "status": payload.get("status"),
+        "provider": payload.get("provider"),
+        "role": payload.get("role"),
+        "duration_seconds": payload.get("duration_seconds"),
+        "stream_finish_reason": payload.get("stream_finish_reason"),
+        "stream_retry_count": payload.get("stream_retry_count", 0),
+        "usage": payload.get("usage", {}),
+    }
+    RUN_LOG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    fd = os.open(RUN_LOG_PATH, flags, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def job_paths(job_id: str) -> tuple[Path, Path, Path]:
+    if not job_id or any(char not in "0123456789abcdef-" for char in job_id):
+        raise WorkerError("invalid worker job id")
+    return (
+        JOB_ROOT / f"{job_id}.json",
+        JOB_ROOT / f"{job_id}.stdout",
+        JOB_ROOT / f"{job_id}.stderr",
+    )
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".worker-job-", delete=False) as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+        handle.write("\n")
+        temporary = Path(handle.name)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def launch_worker(args: argparse.Namespace) -> dict[str, Any]:
+    """Start a run in a separate process group and return immediately for Desktop polling."""
+    load_task(args.task, args.task_file)
+    workdir = Path(args.workdir).expanduser().resolve()
+    if not workdir.is_dir():
+        raise WorkerError(f"workdir not found: {workdir}")
+    job_id = f"{int(time.time())}-{secrets.token_hex(6)}"
+    metadata_path, stdout_path, stderr_path = job_paths(job_id)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--json",
+        "run",
+        "--role",
+        args.role,
+        "--workdir",
+        str(workdir),
+        "--provider",
+        args.provider,
+        "--sandbox",
+        args.sandbox,
+        "--timeout",
+        str(args.timeout),
+    ]
+    if args.task_file:
+        command.extend(("--task-file", str(Path(args.task_file).expanduser().resolve())))
+    else:
+        command.extend(("--task", args.task))
+    if args.no_record:
+        command.append("--no-record")
+    JOB_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+        os.chmod(stdout_path, 0o600)
+        os.chmod(stderr_path, 0o600)
+        process = subprocess.Popen(
+            command,
+            cwd=workdir,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+    write_json(
+        metadata_path,
+        {
+            "job_id": job_id,
+            "pid": process.pid,
+            "started_at": datetime.now(UTC).isoformat(),
+            "role": args.role,
+            "provider": args.provider,
+            "workdir": str(workdir),
+        },
+    )
+    return {"status": "running", "job_id": job_id, "role": args.role, "provider": args.provider}
+
+
+def process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def poll_worker(job_id: str) -> dict[str, Any]:
+    metadata_path, stdout_path, stderr_path = job_paths(job_id)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkerError(f"worker job not found: {type(exc).__name__}") from exc
+    try:
+        raw = stdout_path.read_text(encoding="utf-8").strip()
+        result = json.loads(raw) if raw else None
+    except (OSError, json.JSONDecodeError):
+        result = None
+    if isinstance(result, dict):
+        return {**result, "job_id": job_id, "job_state": "completed"}
+    if process_is_running(int(metadata.get("pid", 0))):
+        return {"status": "running", "job_id": job_id, "job_state": "running"}
+    try:
+        error = redact(stderr_path.read_text(encoding="utf-8"), 300)
+    except OSError:
+        error = "worker exited without result"
+    return {
+        "status": "error",
+        "job_id": job_id,
+        "job_state": "completed",
+        "summary": "DeepSeek worker exited without a structured result.",
+        "files_changed": [],
+        "tests": [],
+        "risks": [error or "worker exited without result"],
+    }
+
+
+def run_worker(args: argparse.Namespace) -> dict[str, Any]:
+    task = load_task(args.task, args.task_file)
+    decision = route(args.role, task)
+    if decision["target"] != "deepseek":
+        return {
+            "status": "routed_to_main",
+            "target": decision["target"],
+            "role": decision["role"],
+            "reason": decision["reason"],
+            "summary": "Task intentionally retained by the configured main-model route.",
+            "files_changed": [],
+            "tests": [],
+            "risks": [],
+        }
+
+    workdir = Path(args.workdir).expanduser().resolve()
+    if not workdir.is_dir():
+        raise WorkerError(f"workdir not found: {workdir}")
+    selected_provider = args.provider if args.provider != "auto" else decision["provider"]
+    if selected_provider not in PROVIDERS:
+        raise WorkerError(f"unknown provider: {selected_provider}")
+    provider_order = build_provider_order(decision["role"], selected_provider, args.provider == "auto")
+    sandbox = args.sandbox if args.sandbox != "auto" else decision["sandbox"]
+    lock_handle = None
+    if sandbox == "workspace-write":
+        try:
+            lock_handle = workdir_lock(workdir)
+        except WorkerError as exc:
+            payload = {
+                "status": "blocked",
+                "provider": selected_provider,
+                "profile": PROVIDERS[selected_provider]["profile"],
+                "role": decision["role"],
+                "summary": "A write worker is already active for this workdir.",
+                "files_changed": [],
+                "tests": [],
+                "risks": [str(exc)],
+                "usage": {},
+                "duration_seconds": 0.0,
+            }
+            if not args.no_record:
+                record_run(payload)
+            return payload
+    try:
+        return _run_worker_locked(args, task, workdir, decision, selected_provider, provider_order, sandbox)
+    finally:
+        if lock_handle is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+
+
+def _run_worker_locked(
+    args: argparse.Namespace,
+    task: str,
+    workdir: Path,
+    decision: dict[str, Any],
+    selected_provider: str,
+    provider_order: list[str],
+    sandbox: str,
+) -> dict[str, Any]:
+    before = workspace_snapshot(workdir)
+    current_snapshot = before
+    started = time.monotonic()
+    total_timeout = effective_timeout(args.timeout, decision["role"])
+    attempt_timeouts = provider_timeouts(total_timeout, len(provider_order))
+    attempts: list[dict[str, str]] = []
+    completed: subprocess.CompletedProcess[str] | None = None
+    message: dict[str, Any] | None = None
+    usage: dict[str, int] = {}
+    total_usage: dict[str, int] = {}
+    side_effect_attempt: dict[str, Any] | None = None
+    accepted = False
+    used_stream_retry = False
+    last_stream = {"finish_reason": None, "failure": None}
+    provider = selected_provider
+    profile = PROVIDERS[provider]["profile"]
+    for attempt_index, provider in enumerate(provider_order):
+        profile = PROVIDERS[provider]["profile"]
+        command = [
+            str(OPENCODE_PATH),
+            "run",
+            "--dir",
+            str(workdir),
+            "--agent",
+            "plan" if sandbox == "read-only" else "build",
+            "--model",
+            str(PROVIDERS[provider]["model"]),
+            "--format",
+            "json",
+            "--title",
+            f"deepseek-worker:{decision['role']}",
+            worker_prompt(task, decision["role"]),
+        ]
+        provider_deadline = time.monotonic() + attempt_timeouts[attempt_index]
+        stream_retry_count = 0
+        while True:
+            remaining_seconds = max(1, int(provider_deadline - time.monotonic()))
+            try:
+                completed = invoke_codex(
+                    command,
+                    workdir,
+                    remaining_seconds,
+                    env={**os.environ, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "131072"},
+                )
+            except FileNotFoundError as exc:
+                raise WorkerError("opencode command not found") from exc
+            message, usage, invalid_result, task_activity = parse_worker_events(completed.stdout)
+            stream = opencode_stream_diagnostics(completed.stdout)
+            last_stream = stream
+            for key, value in usage.items():
+                total_usage[key] = total_usage.get(key, 0) + value
+            attempt_snapshot = workspace_snapshot(workdir)
+            attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
+            current_snapshot = attempt_snapshot
+            declared_changes = set(message.get("files_changed", [])) if message is not None else set()
+            declared_mismatch = bool(message is not None and declared_changes != set(attempt_changes))
+            if (
+                completed.returncode == 0
+                and message is not None
+                and task_activity
+                and not declared_mismatch
+                and stream["failure"] is None
+            ):
+                accepted = True
+                break
+            attempt_label = provider if stream_retry_count == 0 else f"{provider} retry"
+            attempts.append(
+                {
+                    "provider": attempt_label,
+                    "error": (
+                        "declared files do not match the real workdir diff"
+                        if declared_mismatch
+                        else str(stream["failure"])
+                        if stream["failure"] is not None
+                        else "invalid structured worker result"
+                        if invalid_result or message is None
+                        else "no task tool activity"
+                        if not task_activity
+                        else redact(completed.stderr or completed.stdout, 300)
+                    ),
+                }
+            )
+            if attempt_changes:
+                side_effect_attempt = {"provider": provider, "files_changed": attempt_changes}
+                break
+            retry_budget = int(provider_deadline - time.monotonic())
+            if stream["failure"] is not None and stream_retry_count == 0 and retry_budget >= 5:
+                stream_retry_count += 1
+                used_stream_retry = True
+                continue
+            break
+        if accepted or side_effect_attempt is not None:
+            break
+    duration = round(time.monotonic() - started, 2)
+    assert completed is not None
+    after = workspace_snapshot(workdir)
+    detected = changed_workspace_paths(before, after)
+
+    if side_effect_attempt is not None and not accepted:
+        payload = {
+            "status": "partial",
+            "provider": provider,
+            "profile": profile,
+            "role": decision["role"],
+            "summary": "DeepSeek changed the workspace but did not return a valid structured result; fallback stopped for main-model review.",
+            "files_changed": detected,
+            "tests": [],
+            "risks": [
+                "provider fallback stopped after workspace changes to avoid duplicate writes",
+                f"{side_effect_attempt['provider']}: {attempts[-1]['error']}",
+            ],
+            "usage": total_usage,
+            "duration_seconds": duration,
+            "stream_finish_reason": last_stream.get("finish_reason"),
+            "stream_retry_count": 1 if used_stream_retry else 0,
+            "timeout_seconds": total_timeout,
+        }
+    elif not accepted:
+        payload = {
+            "status": "error",
+            "provider": provider,
+            "profile": profile,
+            "role": decision["role"],
+            "summary": "DeepSeek worker did not complete successfully.",
+            "files_changed": detected,
+            "tests": [],
+            "risks": ["all DeepSeek providers failed", *[f"{item['provider']}: {item['error']}" for item in attempts]],
+            "usage": total_usage,
+            "duration_seconds": duration,
+            "stream_finish_reason": last_stream.get("finish_reason"),
+            "stream_retry_count": 1 if used_stream_retry else 0,
+            "timeout_seconds": total_timeout,
+        }
+    else:
+        payload = {
+            "status": str(message.get("status", "success")),
+            "provider": provider,
+            "profile": profile,
+            "role": decision["role"],
+            "summary": str(message.get("summary", ""))[:4000],
+            "files_changed": sorted(set(message.get("files_changed", [])) | set(detected)),
+            "tests": list(message.get("tests", [])),
+            "risks": list(message.get("risks", []))
+            + (["bounded same-provider stream retry was used"] if used_stream_retry else [])
+            + (["provider fallback was used after an earlier DeepSeek route failed"] if attempt_index > 0 else []),
+            "usage": total_usage,
+            "duration_seconds": duration,
+            "stream_finish_reason": last_stream.get("finish_reason"),
+            "stream_retry_count": 1 if used_stream_retry else 0,
+            "timeout_seconds": total_timeout,
+        }
+    if not args.no_record:
+        record_run(payload)
+    return payload
+
+
+def get_model_ids() -> tuple[list[str], str | None]:
+    try:
+        result = subprocess.run(
+            ["codex", "debug", "models"],
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], type(exc).__name__
+    if result.returncode != 0:
+        return [], redact(result.stderr)
+    try:
+        payload = json.loads(result.stdout)
+        return [str(item.get("slug")) for item in payload.get("models", [])], None
+    except (json.JSONDecodeError, AttributeError):
+        return [], "invalid model catalog JSON"
+
+
+def build_catalog(output: Path) -> dict[str, Any]:
+    result = subprocess.run(
+        ["codex", "debug", "models"],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise WorkerError("cannot read the live Codex model catalog")
+    try:
+        payload = json.loads(result.stdout)
+        models = payload["models"]
+        template = next(item for item in models if item.get("slug") == "gpt-5.6-terra")
+    except (json.JSONDecodeError, KeyError, StopIteration, TypeError) as exc:
+        raise WorkerError("live Codex model catalog has an unsupported shape") from exc
+    candidate = copy.deepcopy(template)
+    candidate.update(
+        {
+            "slug": "deepseek-v4-flash",
+            "display_name": "DeepSeek V4 Flash",
+            "description": "Text-only execution worker registered for custom Codex agent profiles.",
+            "default_reasoning_level": "xhigh",
+            "supported_reasoning_levels": [
+                {"effort": "medium", "description": "Balanced execution"},
+                {"effort": "high", "description": "Deeper execution reasoning"},
+                {"effort": "xhigh", "description": "Maximum configured execution reasoning"},
+            ],
+            "priority": 100,
+            "additional_speed_tiers": [],
+            "service_tiers": [],
+            "context_window": 128000,
+            "max_context_window": 128000,
+            "effective_context_window_percent": 90,
+            "input_modalities": ["text"],
+            "supports_image_detail_original": False,
+            "supports_search_tool": False,
+        }
+    )
+    models = [item for item in models if item.get("slug") != "deepseek-v4-flash"]
+    models.append(candidate)
+    rendered = json.dumps({"models": models}, ensure_ascii=False, indent=2) + "\n"
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, prefix=".model-catalog.", delete=False) as handle:
+        handle.write(rendered)
+        temporary = Path(handle.name)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+    return {
+        "status": "success",
+        "catalog_path": str(output),
+        "models": len(models),
+        "deepseek_registered": True,
+        "enabled_globally": False,
+    }
+
+
+def native_check(profile: str) -> dict[str, Any]:
+    profile_path = CODEX_HOME / f"{profile}.config.toml"
+    try:
+        profile_config = tomllib.load(profile_path.open("rb"))
+        catalog_path = str(profile_config["model_catalog_json"])
+    except (OSError, KeyError, tomllib.TOMLDecodeError) as exc:
+        return {"status": "error", "profile": profile, "error": f"invalid native test profile: {type(exc).__name__}"}
+    result = subprocess.run(
+        ["codex", "-c", f'model_catalog_json="{catalog_path}"', "debug", "models"],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {"status": "error", "profile": profile, "error": redact(result.stderr)}
+    try:
+        payload = json.loads(result.stdout)
+        models = [str(item.get("slug")) for item in payload.get("models", [])]
+    except (json.JSONDecodeError, AttributeError):
+        return {"status": "error", "profile": profile, "error": "invalid model catalog JSON"}
+    return {
+        "status": "success" if "deepseek-v4-flash" in models else "blocked",
+        "profile": profile,
+        "catalog_path": catalog_path,
+        "deepseek_registered": "deepseek-v4-flash" in models,
+        "model_count": len(models),
+    }
+
+
+def native_smoke(agent_type: str, workdir: Path, timeout: int) -> dict[str, Any]:
+    provider_for_agent = {
+        "explorer": "sensenova",
+        "worker": "sensenova1",
+        "default": "opencode-go",
+        "deepseek-worker": "opencode-go",
+    }
+    expected_provider = provider_for_agent.get(agent_type)
+    if expected_provider is None:
+        raise WorkerError(f"unsupported native smoke agent: {agent_type}")
+    log_offset = BRIDGE_LOG_PATH.stat().st_size if BRIDGE_LOG_PATH.is_file() else 0
+    prompt = (
+        f"Spawn exactly one `{agent_type}` subagent. Ask it to list only top-level names in the current "
+        "directory without modifying files. Its final response must be exactly the required five-field JSON "
+        "contract. Wait for it and close it. Your own final response must return that received contract verbatim "
+        "as exactly the same JSON object; do not add prose or Markdown."
+    )
+    command = [
+        "codex",
+        "--strict-config",
+        "--profile",
+        NATIVE_TEST_PROFILE,
+        "exec",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--output-schema",
+        str(SCHEMA_PATH),
+        "--json",
+        prompt,
+    ]
+    completed = invoke_codex(command, workdir, timeout)
+    spawned = waited = parent_received = False
+    errors: list[str] = []
+    for line in completed.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item") or {}
+        if item.get("type") == "collab_tool_call" and item.get("tool") == "spawn_agent":
+            spawned = bool(item.get("receiver_thread_ids")) and item.get("status") == "completed"
+        elif item.get("type") == "collab_tool_call" and item.get("tool") == "wait":
+            waited = item.get("status") == "completed"
+        elif item.get("type") == "agent_message":
+            parent_received = True
+    result, invalid_parent_result = native_result_contract(completed.stdout)
+    result_contract_valid = result is not None
+    if "Unknown model" in completed.stderr or "Unknown model" in completed.stdout:
+        errors.append("unknown model")
+    appended = ""
+    if BRIDGE_LOG_PATH.is_file():
+        with BRIDGE_LOG_PATH.open("rb") as handle:
+            handle.seek(log_offset)
+            appended = handle.read().decode("utf-8", errors="replace")
+    provider_completed = f"completed backend={expected_provider}" in appended
+    if not result_contract_valid:
+        errors.append("missing valid structured result contract")
+    status = "success" if completed.returncode == 0 and spawned and waited and parent_received and result_contract_valid and provider_completed else "blocked"
+    if completed.returncode != 0:
+        errors.append(redact(completed.stderr or completed.stdout, 300))
+    return {
+        "status": status,
+        "agent_type": agent_type,
+        "expected_provider": expected_provider,
+        "spawned": spawned,
+        "completed": waited,
+        "parent_received": parent_received,
+        "result_contract_valid": result_contract_valid,
+        "invalid_parent_result": invalid_parent_result,
+        "result_status": result.get("status") if result else None,
+        "provider_completed": provider_completed,
+        "errors": errors,
+    }
+
+
+def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_override: str | None = None) -> dict[str, Any]:
+    agent_for_provider = {"sensenova": "explorer", "sensenova1": "worker", "opencode-go": "default"}
+    agent_type = agent_for_provider.get(provider)
+    if agent_type is None:
+        raise WorkerError(f"unsupported native canary provider: {provider}")
+    try:
+        config = tomllib.load(CONFIG_PATH.open("rb"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkerError(f"cannot read Codex config: {type(exc).__name__}") from exc
+    root_provider = str(config.get("model_provider", ""))
+    parent_model = parent_model_override or str(config.get("model", ""))
+    if root_provider != "openai-chatgpt":
+        raise WorkerError("native canary requires root model_provider=openai-chatgpt")
+    if not parent_model:
+        raise WorkerError("native canary requires a configured parent model")
+    catalog_source = Path(str(config.get("model_catalog_json", DEFAULT_CATALOG_PATH))).expanduser().resolve()
+    codex = desktop_codex_binary()
+    version_result = subprocess.run([str(codex), "--version"], text=True, capture_output=True, timeout=10, check=False)
+    desktop_version = version_result.stdout.strip() if version_result.returncode == 0 else "unknown"
+    nonce = secrets.token_hex(16)
+    child_contract = {
+        "status": "success",
+        "summary": f"native-v1-canary:{nonce}",
+        "files_changed": [],
+        "tests": ["received bounded native V1 task"],
+        "risks": [],
+    }
+    child_task = (
+        "This is a read-only native V1 task-delivery canary. Do not call tools and do not modify files. "
+        "Return exactly this JSON object with no Markdown or surrounding prose: "
+        + json.dumps(child_contract, separators=(",", ":"))
+    )
+    prompt = (
+        f"Use the native spawn_agent tool exactly once. Set agent_type to {agent_type} and fork_turns to none. "
+        f"Give it this task verbatim: <canary-task>{child_task}</canary-task> Then wait for that subagent. "
+        "Do not synthesize or repair the child response. Return the child's response verbatim as your final response."
+    )
+    config_before = file_fingerprint(CONFIG_PATH)
+    state_before = state_db_snapshot()
+    log_offset = BRIDGE_LOG_PATH.stat().st_size if BRIDGE_LOG_PATH.is_file() else 0
+    with tempfile.TemporaryDirectory(prefix="deepseek-native-v1-") as temporary_dir:
+        temporary_root = Path(temporary_dir)
+        isolated_home = temporary_root / "codex-home"
+        isolated_agents = isolated_home / "agents"
+        isolated_workspace = temporary_root / "workspace"
+        isolated_agents.mkdir(parents=True)
+        isolated_workspace.mkdir()
+        write_native_canary_config(CONFIG_PATH, isolated_home / "config.toml", provider)
+        role_source = CODEX_HOME / "agents" / f"{agent_type}.toml"
+        if not role_source.is_file():
+            raise WorkerError(f"native canary role not found: {agent_type}")
+        shutil.copy2(role_source, isolated_agents / role_source.name)
+        for auth_name in ("auth.json", "current_account"):
+            auth_source = CODEX_HOME / auth_name
+            if auth_source.is_file():
+                (isolated_home / auth_name).symlink_to(auth_source)
+        catalog = temporary_root / "models.json"
+        build_v1_canary_catalog(catalog_source, catalog, parent_model)
+        command = native_v1_command(codex, catalog, parent_model, prompt)
+        isolated_env = dict(os.environ)
+        isolated_env["CODEX_HOME"] = str(isolated_home)
+        completed = invoke_codex(command, isolated_workspace, timeout, env=isolated_env)
+        child_result, child_id, spawned, waited, nonce_verified = native_v1_child_result(completed.stdout, nonce)
+        child_metadata = native_child_metadata(isolated_home, child_id)
+        isolated_state_created = any(isolated_home.glob("state_*.sqlite"))
+    provider_completed = bridge_provider_completed(BRIDGE_LOG_PATH, log_offset, provider)
+    diagnostics = native_event_diagnostics(completed.stdout)
+    config_unchanged = config_before == file_fingerprint(CONFIG_PATH)
+    state_db_unchanged = state_before == state_db_snapshot()
+    metadata_valid = bool(
+        child_metadata
+        and child_metadata.get("model_provider") == provider
+        and child_metadata.get("model") == "deepseek-v4-flash"
+        and str(child_metadata.get("agent_role", "")).lower() == agent_type.lower()
+    )
+    errors: list[str] = []
+    warnings: list[str] = []
+    if completed.returncode != 0:
+        errors.append(redact(completed.stderr or completed.stdout, 300))
+    if "Unknown model" in completed.stderr or "Unknown model" in completed.stdout:
+        errors.append("unknown model")
+    if not spawned:
+        errors.append("native V1 spawn event not completed")
+    if not waited:
+        errors.append("native V1 wait event not completed")
+    if child_result is None:
+        errors.append("wait event did not contain a valid direct child result")
+    elif not nonce_verified:
+        errors.append("direct child result did not contain the assigned nonce")
+    if not provider_completed:
+        errors.append(f"bridge did not record completion for {provider}")
+    if not metadata_valid:
+        errors.append("isolated state DB did not confirm the expected child provider/model/role")
+    if not isolated_state_created:
+        errors.append("native V1 canary did not create an isolated state DB")
+    if not config_unchanged:
+        errors.append("Codex config changed during canary")
+    if not state_db_unchanged:
+        warnings.append("live Codex state DB changed concurrently; canary child state was confined to temporary CODEX_HOME")
+    status = "success" if completed.returncode == 0 and not errors else "blocked"
+    return {
+        "status": status,
+        "protocol": "v1",
+        "desktop_codex_version": desktop_version,
+        "root_model_provider": root_provider,
+        "parent_model": parent_model,
+        "agent_type": agent_type,
+        "expected_provider": provider,
+        "spawned": spawned,
+        "waited": waited,
+        "child_result_valid": child_result is not None,
+        "nonce_verified": nonce_verified,
+        "provider_completed": provider_completed,
+        "child_metadata_valid": metadata_valid,
+        "state_db_isolated": isolated_state_created,
+        "config_unchanged": config_unchanged,
+        "state_db_unchanged": state_db_unchanged,
+        "errors": errors,
+        "warnings": warnings,
+        "diagnostics": diagnostics,
+    }
+
+
+def cliproxy_native_canary(workdir: Path, timeout: int, parent_model_override: str | None = None) -> dict[str, Any]:
+    try:
+        config = tomllib.load(CONFIG_PATH.open("rb"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkerError(f"cannot read Codex config: {type(exc).__name__}") from exc
+    root_provider = str(config.get("model_provider", ""))
+    parent_model = parent_model_override or "gpt-5.6-sol"
+    if root_provider != "openai-chatgpt":
+        raise WorkerError("CLIProxyAPI canary requires root model_provider=openai-chatgpt")
+    catalog_source = Path(str(config.get("model_catalog_json", DEFAULT_CATALOG_PATH))).expanduser().resolve()
+    codex = desktop_codex_binary()
+    nonce = secrets.token_hex(16)
+    child_task = (
+        f"This is read-only CLIProxyAPI native Agent Team canary run {nonce}. Two files named .cliproxy-canary-a and "
+        ".cliproxy-canary-b exist in your current working directory. Their contents are not included in this task. "
+        "Use the shell tool to read them with exactly two independent commands in one parallel tool-use turn. "
+        "Do not modify files. Return exactly one JSON object with no Markdown or surrounding prose and exactly "
+        "these fields: status='success'; summary='cliproxy-native-canary:<content-a>:<content-b>'; "
+        "files_changed=[]; tests=['parallel hidden tokens verified']; risks=[]. Replace both placeholders with the "
+        "exact file contents. You cannot complete this task correctly without reading both files."
+    )
+    prompt = (
+        "Use native spawn_agent exactly once. Its arguments must contain agent_type=explorer and exactly one "
+        "fork_turns field whose value is none. Give it this task "
+        f"verbatim: <canary-task>{child_task}</canary-task> Wait for the child. Do not execute the child's shell "
+        "commands yourself, and do not synthesize or repair its response. Return the child's response verbatim."
+    )
+    config_before = file_fingerprint(CONFIG_PATH)
+    state_before = state_db_snapshot()
+    log_path = CLIPROXY_CANARY_LOG_PATH
+    log_offset = log_path.stat().st_size if log_path.is_file() else 0
+    with tempfile.TemporaryDirectory(prefix="deepseek-cliproxy-v2-") as temporary_dir:
+        temporary_root = Path(temporary_dir)
+        isolated_home = temporary_root / "codex-home"
+        isolated_agents = isolated_home / "agents"
+        isolated_workspace = temporary_root / "workspace"
+        isolated_agents.mkdir(parents=True)
+        isolated_workspace.mkdir()
+        hidden_a = secrets.token_hex(16)
+        hidden_b = secrets.token_hex(16)
+        (isolated_workspace / ".cliproxy-canary-a").write_text(hidden_a, encoding="utf-8")
+        (isolated_workspace / ".cliproxy-canary-b").write_text(hidden_b, encoding="utf-8")
+        expected_summary = f"cliproxy-native-canary:{hidden_a}:{hidden_b}"
+        for auth_name in ("auth.json", "current_account"):
+            auth_source = CODEX_HOME / auth_name
+            if auth_source.is_file():
+                (isolated_home / auth_name).symlink_to(auth_source)
+        catalog = isolated_home / "models.json"
+        build_cliproxy_canary_catalog(catalog_source, catalog, parent_model)
+        config_text = f'''model_provider = "openai-chatgpt"
+model_catalog_json = "{catalog}"
+model = "{parent_model}"
+model_reasoning_effort = "medium"
+
+[model_providers.openai-chatgpt]
+name = "CLIProxyAPI OpenAI Parent"
+wire_api = "responses"
+requires_openai_auth = false
+base_url = "{CLIPROXY_CANARY_URL}"
+experimental_bearer_token = "{CLIPROXY_CANARY_KEY}"
+
+[model_providers.cliproxy-deepseek]
+name = "CLIProxyAPI DeepSeek Alias"
+wire_api = "responses"
+requires_openai_auth = false
+base_url = "{CLIPROXY_CANARY_URL}"
+experimental_bearer_token = "{CLIPROXY_CANARY_KEY}"
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 2
+'''
+        (isolated_home / "config.toml").write_text(config_text, encoding="utf-8")
+        os.chmod(isolated_home / "config.toml", 0o600)
+        role_text = f'''name = "explorer"
+description = "Read-only DeepSeek canary through a Codex-safe CLIProxyAPI alias."
+model_provider = "cliproxy-deepseek"
+model = "{CLIPROXY_ALIAS}"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+developer_instructions = "Use shell tools for the bounded task and return only the requested strict JSON."
+'''
+        (isolated_agents / "explorer.toml").write_text(role_text, encoding="utf-8")
+        command = [
+            str(codex),
+            "--strict-config",
+            "-c", "features.multi_agent=true",
+            "-c", "features.multi_agent_v2=true",
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox", "read-only",
+            "--json",
+            prompt,
+        ]
+        isolated_env = dict(os.environ)
+        isolated_env["CODEX_HOME"] = str(isolated_home)
+        canary_started_ms = int(time.time() * 1000) - 1000
+        completed = invoke_codex(command, isolated_workspace, timeout, env=isolated_env)
+        child_result, child_id, spawned, waited, nonce_verified = native_v1_child_result(completed.stdout, nonce)
+        discovered = find_isolated_native_child(
+            isolated_home,
+            "cliproxy-deepseek",
+            CLIPROXY_ALIAS,
+            "explorer",
+            canary_started_ms,
+            nonce,
+        )
+        discovered_child = discovered["child"]
+        if child_id is None and discovered_child:
+            child_id = discovered_child["id"]
+        child_metadata = discovered_child or native_child_metadata(isolated_home, child_id)
+        rollout_path = discovered_child.get("rollout_path") if discovered_child else None
+        rollout_evidence = child_rollout_evidence(
+            isolated_home,
+            child_id,
+            nonce,
+            rollout_path,
+            expected_summary,
+            (hidden_a, hidden_b),
+        )
+        if rollout_evidence["final_result"] is not None:
+            child_result = rollout_evidence["final_result"]
+            nonce_verified = rollout_evidence["final_result_nonce_verified"]
+        spawn_inferred_from_state = bool(waited and discovered_child and rollout_evidence["task_payload_present"])
+        spawned = spawned or spawn_inferred_from_state
+        isolated_state_created = any(isolated_home.glob("state_*.sqlite"))
+    proxy_response_requests = 0
+    if log_path.is_file() and log_path.stat().st_size >= log_offset:
+        with log_path.open("rb") as handle:
+            handle.seek(log_offset)
+            proxy_response_requests = handle.read().count(b'POST    "/v1/responses"')
+    proxy_completed = proxy_response_requests >= 2
+    config_unchanged = config_before == file_fingerprint(CONFIG_PATH)
+    state_db_unchanged = state_before == state_db_snapshot()
+    metadata_valid = bool(
+        child_metadata
+        and child_metadata.get("model_provider") == "cliproxy-deepseek"
+        and child_metadata.get("model") == CLIPROXY_ALIAS
+        and str(child_metadata.get("agent_role", "")).lower() == "explorer"
+    )
+    errors: list[str] = []
+    warnings: list[str] = []
+    combined_output = completed.stdout + "\n" + completed.stderr
+    if completed.returncode != 0:
+        errors.append(redact(completed.stderr or completed.stdout, 300))
+    if "Unknown model" in combined_output:
+        errors.append("unknown model")
+    if not spawned:
+        errors.append("native V2 spawn event not completed")
+    if not waited:
+        errors.append("native V2 wait event not completed")
+    if child_result is None or not nonce_verified:
+        errors.append("direct child result did not contain the assigned nonce contract")
+    if not rollout_evidence["task_payload_present"]:
+        errors.append("child rollout did not contain the assigned task nonce")
+    if not rollout_evidence["tool_calls"] or rollout_evidence["tool_outputs"] < 1:
+        errors.append("child rollout did not contain a completed shell tool exchange")
+    if not rollout_evidence["expected_outputs_verified"]:
+        errors.append("child shell outputs did not contain both hidden challenge tokens")
+    if not proxy_completed:
+        errors.append("CLIProxyAPI did not record the child Responses request")
+    if not metadata_valid:
+        errors.append("isolated state DB did not confirm the alias provider/model/role")
+    if not isolated_state_created:
+        errors.append("canary did not create an isolated state DB")
+    if not config_unchanged:
+        errors.append("live Codex config changed during canary")
+    if not state_db_unchanged:
+        warnings.append("live Codex state DB changed concurrently; canary state remained isolated")
+    if not rollout_evidence["parallel_tool_calls_observed"]:
+        warnings.append("parallel child tool calls were not observed in this run")
+    return {
+        "status": "success" if completed.returncode == 0 and not errors else "blocked",
+        "protocol": "v2",
+        "parent_model": parent_model,
+        "child_model_alias": CLIPROXY_ALIAS,
+        "root_model_provider": root_provider,
+        "spawned": spawned,
+        "spawn_inferred_from_state": spawn_inferred_from_state,
+        "waited": waited,
+        "child_result_valid": child_result is not None,
+        "nonce_verified": nonce_verified,
+        "task_payload_present": rollout_evidence["task_payload_present"],
+        "tool_calls": rollout_evidence["tool_calls"],
+        "tool_outputs": rollout_evidence["tool_outputs"],
+        "hidden_outputs_verified": rollout_evidence["expected_outputs_verified"],
+        "parallel_tool_calls_observed": rollout_evidence["parallel_tool_calls_observed"],
+        "proxy_completed": proxy_completed,
+        "proxy_response_requests": proxy_response_requests,
+        "child_metadata_valid": metadata_valid,
+        "child_candidate_count": discovered["candidate_count"],
+        "state_db_isolated": isolated_state_created,
+        "config_unchanged": config_unchanged,
+        "state_db_unchanged": state_db_unchanged,
+        "errors": errors,
+        "warnings": warnings,
+        "diagnostics": native_event_diagnostics(completed.stdout),
+    }
+
+
+def bridge_health(port: int) -> dict[str, Any]:
+    url = f"http://127.0.0.1:{port}/v1/health"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            payload = json.loads(response.read().decode())
+        return {"ok": response.status == 200 and payload.get("status") == "ok", "url": url}
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        return {"ok": False, "url": url, "error": type(exc).__name__}
+
+
+def doctor() -> dict[str, Any]:
+    problems: list[str] = []
+    checks: dict[str, Any] = {
+        "codex_command": bool(subprocess.run(["sh", "-c", "command -v codex"], capture_output=True).returncode == 0),
+        "opencode_command": OPENCODE_PATH.is_file() and os.access(OPENCODE_PATH, os.X_OK),
+        "config_path": str(CONFIG_PATH),
+        "result_schema": SCHEMA_PATH.is_file(),
+        "profiles": {},
+        "bridges": {},
+        "candidate_catalog": {"path": str(DEFAULT_CATALOG_PATH), "exists": DEFAULT_CATALOG_PATH.is_file()},
+    }
+    config: dict[str, Any] = {}
+    try:
+        config = tomllib.load(CONFIG_PATH.open("rb"))
+        checks["root_model_provider"] = config.get("model_provider")
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        problems.append(f"config: {type(exc).__name__}")
+    for provider, metadata in PROVIDERS.items():
+        profile_path = CODEX_HOME / f"{metadata['profile']}.config.toml"
+        valid = False
+        try:
+            profile = tomllib.load(profile_path.open("rb"))
+            valid = profile.get("model_provider") == provider and profile.get("model") == "deepseek-v4-flash"
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+        checks["profiles"][provider] = {"ok": valid, "path": str(profile_path)}
+        checks["bridges"][provider] = bridge_health(int(metadata["port"]))
+        if not valid:
+            problems.append(f"profile:{provider}")
+        if not checks["bridges"][provider]["ok"]:
+            problems.append(f"bridge:{provider}")
+    models, model_error = get_model_ids()
+    checks["native_model_registered"] = "deepseek-v4-flash" in models
+    checks["model_catalog_error"] = model_error
+    if not checks["codex_command"]:
+        problems.append("codex command missing")
+    if not checks["opencode_command"]:
+        problems.append("opencode command missing")
+    if checks.get("root_model_provider") != "openai-chatgpt":
+        problems.append("root provider is not openai-chatgpt")
+    return {
+        "status": "healthy" if not problems else "degraded",
+        "version": VERSION,
+        "checks": checks,
+        "problems": problems,
+    }
+
+
+def stats(hours: float) -> dict[str, Any]:
+    cutoff = datetime.now(UTC) - timedelta(hours=hours)
+    rows: list[dict[str, Any]] = []
+    if RUN_LOG_PATH.is_file():
+        for line in RUN_LOG_PATH.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+                timestamp = datetime.fromisoformat(str(row["timestamp"]).replace("Z", "+00:00"))
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+            if timestamp >= cutoff:
+                rows.append(row)
+    successes = sum(1 for row in rows if row.get("status") == "success")
+    status_counts: dict[str, int] = {}
+    by_provider: dict[str, int] = {}
+    provider_stats: dict[str, dict[str, Any]] = {}
+    total_input = total_cached = total_cache_write = total_output = total_reasoning = 0
+    for row in rows:
+        status = str(row.get("status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        provider = str(row.get("provider", "unknown"))
+        by_provider[provider] = by_provider.get(provider, 0) + 1
+        usage = row.get("usage") or {}
+        input_tokens = int(usage.get("input_tokens", 0))
+        cached_input_tokens = int(usage.get("cached_input_tokens", 0))
+        cache_write_input_tokens = int(usage.get("cache_write_input_tokens", 0))
+        output_tokens = int(usage.get("output_tokens", 0))
+        reasoning_output_tokens = int(usage.get("reasoning_output_tokens", 0))
+        total_input += input_tokens
+        total_cached += cached_input_tokens
+        total_cache_write += cache_write_input_tokens
+        total_output += output_tokens
+        total_reasoning += reasoning_output_tokens
+        detail = provider_stats.setdefault(provider, {
+            "runs": 0,
+            "status_counts": {},
+            "success_rate_percent": 0.0,
+            "duration_seconds": 0.0,
+            "usage": {"input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0},
+        })
+        detail["runs"] += 1
+        detail["status_counts"][status] = detail["status_counts"].get(status, 0) + 1
+        detail["duration_seconds"] += float(row.get("duration_seconds") or 0)
+        for key, value in (("input_tokens", input_tokens), ("cached_input_tokens", cached_input_tokens), ("cache_write_input_tokens", cache_write_input_tokens), ("output_tokens", output_tokens), ("reasoning_output_tokens", reasoning_output_tokens)):
+            detail["usage"][key] += value
+    for detail in provider_stats.values():
+        detail["duration_seconds"] = round(detail["duration_seconds"], 2)
+        detail["success_rate_percent"] = round(100 * detail["status_counts"].get("success", 0) / detail["runs"], 2)
+    return {
+        "status": "success",
+        "window_hours": hours,
+        "runs": len(rows),
+        "successes": successes,
+        "success_rate_percent": round(100 * successes / len(rows), 2) if rows else 0.0,
+        "by_provider": by_provider,
+        "status_counts": status_counts,
+        "provider_stats": provider_stats,
+        "usage": {
+            "input_tokens": total_input,
+            "cached_input_tokens": total_cached,
+            "cache_write_input_tokens": total_cache_write,
+            "output_tokens": total_output,
+            "reasoning_output_tokens": total_reasoning,
+            "request_tokens": total_input + total_output,
+            "context_tokens": total_input + total_output + total_cached + total_cache_write,
+        },
+        "log_path": str(RUN_LOG_PATH),
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    top = argparse.ArgumentParser(prog="deepseek-worker", description="Route and run bounded execution work through DeepSeek V4 Flash.")
+    top.add_argument("--json", action="store_true", help="Emit stable JSON on stdout.")
+    top.add_argument("--version", action="version", version=VERSION)
+    commands = top.add_subparsers(dest="command", required=True)
+
+    commands.add_parser("doctor", help="Check profiles, bridges, root provider, and native model registration.")
+
+    catalog_parser = commands.add_parser("catalog-build", help="Build an isolated model catalog containing the live GPT list plus DeepSeek.")
+    catalog_parser.add_argument("--out", default=str(DEFAULT_CATALOG_PATH))
+
+    native_parser = commands.add_parser("native-check", help="Check whether an isolated profile registers DeepSeek in the Codex model catalog.")
+    native_parser.add_argument("--profile", default=NATIVE_TEST_PROFILE)
+
+    native_smoke_parser = commands.add_parser("native-smoke-test", help="Spawn one read-only native DeepSeek agent and verify provider attribution.")
+    native_smoke_parser.add_argument("--agent", choices=("explorer", "worker", "default", "deepseek-worker"), default="deepseek-worker")
+    native_smoke_parser.add_argument("--workdir", default=str(Path.cwd()))
+    native_smoke_parser.add_argument("--timeout", type=int, default=180)
+
+    native_v1_parser = commands.add_parser(
+        "native-v1-canary",
+        help="Run an isolated Desktop V1 canary and validate the direct child result and provider.",
+    )
+    native_v1_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
+    native_v1_parser.add_argument("--parent-model", help="Override the configured GPT parent for this isolated canary only.")
+    native_v1_parser.add_argument("--workdir", default=str(Path.cwd()))
+    native_v1_parser.add_argument("--timeout", type=int, default=180)
+
+    cliproxy_parser = commands.add_parser(
+        "cliproxy-native-canary",
+        help="Run an isolated native V2 Agent Team canary through the CLIProxyAPI DeepSeek alias.",
+    )
+    cliproxy_parser.add_argument("--parent-model", default="gpt-5.6-sol")
+    cliproxy_parser.add_argument("--workdir", default=str(Path.cwd()))
+    cliproxy_parser.add_argument("--timeout", type=int, default=300)
+
+    route_parser = commands.add_parser("route", help="Resolve a task role to Sol, Terra, or a DeepSeek provider without running a model.")
+    route_parser.add_argument("--role", default="auto")
+    route_parser.add_argument("--task", default="")
+
+    def add_run_arguments(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--task")
+        command_parser.add_argument("--task-file")
+        command_parser.add_argument("--role", default="auto")
+        command_parser.add_argument("--workdir", required=True)
+        command_parser.add_argument("--provider", choices=("auto", *PROVIDERS), default="auto")
+        command_parser.add_argument("--sandbox", choices=("auto", "read-only", "workspace-write"), default="auto")
+        command_parser.add_argument(
+            "--timeout",
+            type=int,
+            default=0,
+            help="Seconds for the whole Worker run; 0 selects 75s read-only or 120s write/general defaults.",
+        )
+        command_parser.add_argument("--no-record", action="store_true")
+
+    run_parser = commands.add_parser("run", help="Run one bounded execution task through a DeepSeek profile.")
+    add_run_arguments(run_parser)
+
+    launch_parser = commands.add_parser("launch", help="Start a Worker task and return a job id for non-blocking polling.")
+    add_run_arguments(launch_parser)
+
+    poll_parser = commands.add_parser("poll", help="Read a launched Worker task result without blocking.")
+    poll_parser.add_argument("--job-id", required=True)
+
+    smoke_parser = commands.add_parser("smoke-test", help="Run a tiny read-only live task through one provider.")
+    smoke_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
+    smoke_parser.add_argument("--workdir", default=str(Path.cwd()))
+    smoke_parser.add_argument("--timeout", type=int, default=120)
+    smoke_parser.add_argument("--no-record", action="store_true")
+
+    stats_parser = commands.add_parser("stats", help="Summarize worker runs without storing or reading task bodies.")
+    stats_parser.add_argument("--hours", type=float, default=8.0)
+    return top
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "doctor":
+            payload = doctor()
+        elif args.command == "catalog-build":
+            payload = build_catalog(Path(args.out).expanduser().resolve())
+        elif args.command == "native-check":
+            payload = native_check(args.profile)
+        elif args.command == "native-smoke-test":
+            workdir = Path(args.workdir).expanduser().resolve()
+            if not workdir.is_dir():
+                raise WorkerError(f"workdir not found: {workdir}")
+            payload = native_smoke(args.agent, workdir, args.timeout)
+        elif args.command == "native-v1-canary":
+            workdir = Path(args.workdir).expanduser().resolve()
+            if not workdir.is_dir():
+                raise WorkerError(f"workdir not found: {workdir}")
+            payload = native_v1_canary(args.provider, workdir, args.timeout, args.parent_model)
+        elif args.command == "cliproxy-native-canary":
+            workdir = Path(args.workdir).expanduser().resolve()
+            if not workdir.is_dir():
+                raise WorkerError(f"workdir not found: {workdir}")
+            payload = cliproxy_native_canary(workdir, args.timeout, args.parent_model)
+        elif args.command == "route":
+            payload = {"status": "success", **route(args.role, args.task)}
+        elif args.command == "run":
+            payload = run_worker(args)
+        elif args.command == "launch":
+            payload = launch_worker(args)
+        elif args.command == "poll":
+            payload = poll_worker(args.job_id)
+        elif args.command == "smoke-test":
+            run_args = argparse.Namespace(
+                task="Inspect the current directory without modifying files. Reply with a short success summary.",
+                task_file=None,
+                role="repository-exploration",
+                workdir=args.workdir,
+                provider=args.provider,
+                sandbox="read-only",
+                timeout=args.timeout,
+                no_record=args.no_record,
+            )
+            payload = run_worker(run_args)
+        else:
+            payload = stats(args.hours)
+    except WorkerError as exc:
+        payload = {"status": "error", "error": str(exc)}
+        emit(payload, args.json)
+        return 2
+    except Exception as exc:  # Keep the CLI contract stable at the boundary.
+        payload = {"status": "error", "error": type(exc).__name__}
+        emit(payload, args.json)
+        return 1
+    emit(payload, args.json)
+    return 0 if payload.get("status") not in {"error"} else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
