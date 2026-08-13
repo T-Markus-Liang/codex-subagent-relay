@@ -74,12 +74,23 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def report(log_path: Path, days: float, now: datetime | None = None) -> dict[str, Any]:
+def report(
+    log_path: Path,
+    days: float,
+    now: datetime | None = None,
+    relay_version: str | None = None,
+    run_type: str | None = None,
+) -> dict[str, Any]:
     if not 0 < days <= 365:
         raise ValueError("days must be between 0 and 365")
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=days)
     rows, invalid = read_rows(log_path, cutoff)
+    source_rows = len(rows)
+    if relay_version:
+        rows = [row for row in rows if row.get("relay_version") == relay_version]
+    if run_type:
+        rows = [row for row in rows if row.get("run_type", "external_run") == run_type]
     by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_provider: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_run_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -93,6 +104,9 @@ def report(log_path: Path, days: float, now: datetime | None = None) -> dict[str
         "utc_window": {"start": cutoff.isoformat(), "end": now.isoformat(), "days": days},
         "log_present": log_path.is_file(),
         "invalid_records_skipped": invalid,
+        "filters": {"relay_version": relay_version, "run_type": run_type},
+        "source_rows_in_window": source_rows,
+        "rows_excluded_by_filters": source_rows - len(rows),
         "overall": summarize(rows),
         "daily": {key: summarize(value) for key, value in sorted(by_day.items())},
         "providers": {key: summarize(value) for key, value in sorted(by_provider.items())},
@@ -108,9 +122,11 @@ def main() -> int:
     parser.add_argument("--days", type=float, default=7)
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--relay-version", help="Include only telemetry recorded by this Relay version.")
+    parser.add_argument("--run-type", help="Include only one run type, for example external_run.")
     args = parser.parse_args()
     try:
-        payload = report(args.log.expanduser(), args.days)
+        payload = report(args.log.expanduser(), args.days, relay_version=args.relay_version, run_type=args.run_type)
     except ValueError as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")))
         return 2

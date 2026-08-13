@@ -39,6 +39,23 @@ class OperationalReportTests(unittest.TestCase):
         self.assertFalse(payload["log_present"])
         self.assertEqual(payload["overall"]["runs"], 0)
 
+    def test_version_and_run_type_filters_exclude_legacy_and_canary_rows(self):
+        now = datetime(2026, 8, 14, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            rows = [
+                {"timestamp": "2026-08-13T00:00:00+00:00", "relay_version": "0.10.6", "status": "success", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 10},
+                {"timestamp": "2026-08-13T01:00:00+00:00", "relay_version": "0.10.5", "status": "error", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 20},
+                {"timestamp": "2026-08-13T02:00:00+00:00", "relay_version": "0.10.6", "status": "success", "provider": "sensenova1", "run_type": "native_v1_canary", "duration_seconds": 30},
+                {"timestamp": "2026-08-13T03:00:00+00:00", "status": "success", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 40},
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            payload = module.report(path, 7, now, relay_version="0.10.6", run_type="external_run")
+        self.assertEqual(payload["overall"]["runs"], 1)
+        self.assertEqual(payload["source_rows_in_window"], 4)
+        self.assertEqual(payload["rows_excluded_by_filters"], 3)
+        self.assertEqual(payload["filters"], {"relay_version": "0.10.6", "run_type": "external_run"})
+
 
 if __name__ == "__main__":
     unittest.main()

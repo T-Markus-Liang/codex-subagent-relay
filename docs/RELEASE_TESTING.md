@@ -123,11 +123,14 @@ For the required seven-day operational observation, generate a source-local UTC 
 each day and preserve only the redacted aggregate report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --out reports/operational-7d.json
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.6 \
+  --run-type external_run --out reports/operational-7d.json
 ```
 
-Only a clean post-release window is eligible: exclude earlier versions, live-qualification attempts,
-manual fault injection, and native canaries from the external production SLO. Review the report's
+Only a clean post-release window is eligible: require the release's `--relay-version`, filter to
+`--run-type external_run`, and exclude live-qualification attempts and manual fault injection from
+the external production SLO. The report exposes excluded-row counts so a missing version on legacy
+telemetry cannot silently enter the window. Review the report's
 daily and per-Provider success rate, P50/P95, fallback, stream retry, partial-write, and blocked
 counts. Its Relay telemetry must remain separate from the Codex Rollout and CC Switch token ledgers;
 use the documented `codex-usage-audit` workflow to report those sources.

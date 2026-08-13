@@ -27,7 +27,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.5"
+VERSION = "0.10.6"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1276,6 +1276,7 @@ def record_run(payload: dict[str, Any], run_type: str = "external_run") -> None:
     risks = payload.get("risks") or []
     record = {
         "timestamp": datetime.now(UTC).isoformat(),
+        "relay_version": VERSION,
         "run_type": run_type,
         "status": payload.get("status"),
         "provider": payload.get("provider") or "unknown",
