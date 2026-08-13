@@ -45,6 +45,9 @@ def report_success_rate(report: dict[str, Any], label: str) -> float:
 def validate_report(report: dict[str, Any], *, label: str, route: str, required_runs: int, minimum_rate: float, write: bool) -> float:
     if report.get("provider") != route:
         raise ManifestError(f"{label}.provider must be explicit route {route}")
+    preflight = report.get("qualification_preflight")
+    if not isinstance(preflight, dict) or preflight.get("opencode_idle") is not True:
+        raise ManifestError(f"{label} does not prove an idle OpenCode qualification environment")
     rate = report_success_rate(report, label)
     if report["runs"] < required_runs:
         raise ManifestError(f"{label}.runs is below {required_runs}")
@@ -81,20 +84,24 @@ def main() -> int:
     parser.add_argument("--write-report", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    manifest = load_object(args.manifest)
-    validate_manifest(manifest)
-    qualification = manifest["qualification"]
-    read = load_object(args.read_report)
-    write = load_object(args.write_report)
-    read_rate = validate_report(read, label="read report", route=args.route, required_runs=qualification["sequential_read_jobs"], minimum_rate=qualification["min_success_rate"], write=False)
-    write_rate = validate_report(write, label="write report", route=args.route, required_runs=qualification["sequential_write_jobs"], minimum_rate=qualification["min_success_rate"], write=True)
-    output = copy.deepcopy(manifest)
-    records = [record for record in output["evidence"]["records"] if record["route"] != args.route]
-    records.append(build_record(args.route, read_rate, write_rate, read, write))
-    output["evidence"]["records"] = sorted(records, key=lambda item: item["route"])
-    validate_manifest(output, require_evidence=len(output["evidence"]["records"]) == len(output["production_routes"]))
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    try:
+        manifest = load_object(args.manifest)
+        validate_manifest(manifest)
+        qualification = manifest["qualification"]
+        read = load_object(args.read_report)
+        write = load_object(args.write_report)
+        read_rate = validate_report(read, label="read report", route=args.route, required_runs=qualification["sequential_read_jobs"], minimum_rate=qualification["min_success_rate"], write=False)
+        write_rate = validate_report(write, label="write report", route=args.route, required_runs=qualification["sequential_write_jobs"], minimum_rate=qualification["min_success_rate"], write=True)
+        output = copy.deepcopy(manifest)
+        records = [record for record in output["evidence"]["records"] if record["route"] != args.route]
+        records.append(build_record(args.route, read_rate, write_rate, read, write))
+        output["evidence"]["records"] = sorted(records, key=lambda item: item["route"])
+        validate_manifest(output, require_evidence=len(output["evidence"]["records"]) == len(output["production_routes"]))
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    except ManifestError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")))
+        return 1
     print(json.dumps({"status": "success", "route": args.route, "out": str(args.out)}, separators=(",", ":")))
     return 0
 

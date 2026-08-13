@@ -19,6 +19,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--role", choices=("repository-exploration", "documentation"), required=True)
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=0)
+    parser.add_argument(
+        "--require-opencode-idle",
+        action="store_true",
+        help="Refuse qualification when any pre-existing OpenCode process is running.",
+    )
     parser.add_argument("--poll-seconds", type=float, default=2.0, help="Delay between durable job polls.")
     parser.add_argument("--job-deadline", type=float, default=180.0, help="Maximum wall-clock seconds for one launch/poll job.")
     parser.add_argument(
@@ -88,6 +93,70 @@ def consecutive_failure_stop(records: list[dict], limit: int) -> str | None:
     if all(record.get("status") != "success" or not record.get("expected_output") for record in recent):
         return f"{limit} consecutive non-success attempts"
     return None
+
+
+def opencode_idle_preflight() -> dict:
+    """Prove only whether OpenCode is idle; never retain process IDs or command arguments."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "comm="], text=True, capture_output=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"opencode_idle": False, "observed_opencode_process_count": None, "inspection": "unavailable"}
+    if completed.returncode != 0:
+        return {"opencode_idle": False, "observed_opencode_process_count": None, "inspection": "unavailable"}
+    count = sum(Path(line.strip()).name == "opencode" for line in completed.stdout.splitlines() if line.strip())
+    return {"opencode_idle": count == 0, "observed_opencode_process_count": count, "inspection": "ok"}
+
+
+def build_report(args: argparse.Namespace, records: list[dict], interrupted: bool, early_stop_reason: str | None, preflight: dict) -> dict:
+    durations = [record["duration_seconds"] for record in records]
+    successes = sum(record["status"] == "success" and record["expected_output"] for record in records)
+    return {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "worker": args.worker,
+        "provider": args.provider,
+        "role": args.role,
+        "runs": len(records),
+        "requested_runs": args.runs,
+        "interrupted": interrupted,
+        "early_stop_reason": early_stop_reason,
+        "qualification_preflight": preflight,
+        "successes": successes,
+        "success_rate_percent": round(100 * successes / len(records), 2) if records else 0.0,
+        "p50_duration_seconds": percentile(durations, 0.5),
+        "p95_duration_seconds": percentile(durations, 0.95),
+        "status_counts": {status: sum(record["status"] == status for record in records) for status in sorted({record["status"] for record in records})},
+        "selected_provider_counts": {
+            provider: sum(record["selected_provider"] == provider for record in records)
+            for provider in sorted({record["selected_provider"] for record in records}, key=str)
+        },
+        "stream_finish_counts": {reason: sum(record["stream_finish_reason"] == reason for record in records) for reason in sorted({record["stream_finish_reason"] for record in records}, key=str)},
+        "fallback_runs": sum(record["fallback_used"] for record in records),
+        "partial_write_runs": sum(record["partial_write"] for record in records),
+        "workspace_verification_failures": sum(not record["workspace_safe"] for record in records),
+        "expected_output_failures": sum(not record["expected_output"] for record in records),
+        "duplicate_write_incidents": (
+            0
+            if args.role == "documentation" and all(record["workspace_safe"] and not record["partial_write"] for record in records)
+            else None
+        ),
+        "write_safety_violations": (
+            sum(record["partial_write"] or not record["workspace_safe"] for record in records)
+            if args.role == "documentation"
+            else 0
+        ),
+        "failure_classes": {
+            reason: sum(record["failure_class"] == reason for record in records)
+            for reason in sorted({record["failure_class"] for record in records if record["failure_class"] is not None})
+        },
+        "records": records,
+    }
+
+
+def write_report(path: Path, report: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
 def cancel_job(worker: str, job_id: str) -> dict:
@@ -165,6 +234,19 @@ def main() -> int:
     records = []
     interrupted = False
     early_stop_reason = None
+    preflight = {
+        "opencode_idle": None,
+        "observed_opencode_process_count": None,
+        "inspection": "not_required",
+    }
+    if args.require_opencode_idle:
+        preflight = opencode_idle_preflight()
+        if not preflight["opencode_idle"]:
+            early_stop_reason = "qualification requires an idle OpenCode environment"
+            report = build_report(args, records, interrupted, early_stop_reason, preflight)
+            write_report(args.report, report)
+            print(json.dumps(report, separators=(",", ":")))
+            return 2
     for index in range(1, args.runs + 1):
         try:
             with tempfile.TemporaryDirectory(prefix="deepseek-worker-soak-") as temporary_dir:
@@ -194,51 +276,10 @@ def main() -> int:
             interrupted = True
             break
 
-    durations = [record["duration_seconds"] for record in records]
-    successes = sum(record["status"] == "success" and record["expected_output"] for record in records)
-    report = {
-        "timestamp": datetime.now(UTC).isoformat(),
-        "worker": args.worker,
-        "provider": args.provider,
-        "role": args.role,
-        "runs": len(records),
-        "requested_runs": args.runs,
-        "interrupted": interrupted,
-        "early_stop_reason": early_stop_reason,
-        "successes": successes,
-        "success_rate_percent": round(100 * successes / len(records), 2) if records else 0.0,
-        "p50_duration_seconds": percentile(durations, 0.5),
-        "p95_duration_seconds": percentile(durations, 0.95),
-        "status_counts": {status: sum(record["status"] == status for record in records) for status in sorted({record["status"] for record in records})},
-        "selected_provider_counts": {
-            provider: sum(record["selected_provider"] == provider for record in records)
-            for provider in sorted({record["selected_provider"] for record in records}, key=str)
-        },
-        "stream_finish_counts": {reason: sum(record["stream_finish_reason"] == reason for record in records) for reason in sorted({record["stream_finish_reason"] for record in records}, key=str)},
-        "fallback_runs": sum(record["fallback_used"] for record in records),
-        "partial_write_runs": sum(record["partial_write"] for record in records),
-        "workspace_verification_failures": sum(not record["workspace_safe"] for record in records),
-        "expected_output_failures": sum(not record["expected_output"] for record in records),
-        "duplicate_write_incidents": (
-            0
-            if args.role == "documentation" and all(record["workspace_safe"] and not record["partial_write"] for record in records)
-            else None
-        ),
-        "write_safety_violations": (
-            sum(record["partial_write"] or not record["workspace_safe"] for record in records)
-            if args.role == "documentation"
-            else 0
-        ),
-        "failure_classes": {
-            reason: sum(record["failure_class"] == reason for record in records)
-            for reason in sorted({record["failure_class"] for record in records if record["failure_class"] is not None})
-        },
-        "records": records,
-    }
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    report = build_report(args, records, interrupted, early_stop_reason, preflight)
+    write_report(args.report, report)
     print(json.dumps(report, separators=(",", ":")))
-    return 0 if not interrupted and successes == args.runs else 1
+    return 0 if not interrupted and report["successes"] == args.runs else 1
 
 
 if __name__ == "__main__":

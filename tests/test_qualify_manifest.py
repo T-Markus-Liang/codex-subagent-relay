@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -23,6 +24,7 @@ class QualifyManifestTests(unittest.TestCase):
             "partial_write_runs": 0,
             "duplicate_write_incidents": 0 if write else None,
             "write_safety_violations": 0 if write else 0,
+            "qualification_preflight": {"opencode_idle": True, "observed_opencode_process_count": 0, "inspection": "ok"},
         }
 
     def test_explicit_reports_build_a_record(self):
@@ -42,6 +44,36 @@ class QualifyManifestTests(unittest.TestCase):
         report["duplicate_write_incidents"] = None
         with self.assertRaises(module.ManifestError):
             module.validate_report(report, label="write report", route="sensenova1", required_runs=100, minimum_rate=.95, write=True)
+
+    def test_report_requires_idle_opencode_preflight(self):
+        report = self.report("sensenova1")
+        report["qualification_preflight"]["opencode_idle"] = False
+        with self.assertRaises(module.ManifestError):
+            module.validate_report(report, label="read report", route="sensenova1", required_runs=100, minimum_rate=.95, write=False)
+
+    def test_cli_returns_json_for_nonqualifying_report(self):
+        report = self.report("sensenova")
+        report["qualification_preflight"]["opencode_idle"] = False
+        root = SCRIPT.parent.parent
+        report_path = root / "reports" / "diagnostic" / "idle-preflight-rejection.json"
+        original = report_path.read_text(encoding="utf-8") if report_path.exists() else None
+        try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            completed = subprocess.run(
+                ["python3.11", str(SCRIPT), "--manifest", str(root / "compatibility" / "manifest.json"), "--route", "sensenova", "--read-report", str(report_path), "--write-report", str(report_path), "--out", "/tmp/relay-nonqualifying-manifest.json"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        finally:
+            if original is None:
+                report_path.unlink(missing_ok=True)
+            else:
+                report_path.write_text(original, encoding="utf-8")
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(json.loads(completed.stdout)["status"], "error")
+        self.assertNotIn("Traceback", completed.stderr)
 
 
 if __name__ == "__main__":

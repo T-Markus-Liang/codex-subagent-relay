@@ -57,6 +57,18 @@ class LiveSoakTests(unittest.TestCase):
         self.assertIsNone(module.consecutive_failure_stop([failed, succeeded, failed], 2))
         self.assertIsNone(module.consecutive_failure_stop([failed, failed], 0))
 
+    def test_opencode_idle_preflight_keeps_only_count_and_state(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": "/bin/zsh\nopencode\n/opt/bin/opencode\n"})()
+        with patch.object(module.subprocess, "run", return_value=completed):
+            preflight = module.opencode_idle_preflight()
+        self.assertEqual(preflight, {"opencode_idle": False, "observed_opencode_process_count": 2, "inspection": "ok"})
+
+    def test_build_report_marks_unchecked_preflight_as_nonqualifying(self):
+        args = type("Args", (), {"worker": "worker", "provider": "sensenova", "role": "documentation", "runs": 100})()
+        report = module.build_report(args, [], False, None, {"opencode_idle": None, "observed_opencode_process_count": None, "inspection": "not_required"})
+        self.assertEqual(report["qualification_preflight"]["inspection"], "not_required")
+        self.assertEqual(report["runs"], 0)
+
     def test_run_job_launches_then_polls_the_same_durable_job(self):
         class Completed:
             def __init__(self, stdout):
