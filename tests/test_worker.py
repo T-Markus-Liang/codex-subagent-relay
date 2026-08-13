@@ -1031,6 +1031,7 @@ class RouterTests(unittest.TestCase):
             with patch.object(module, "invoke_codex", side_effect=results):
                 payload = module.run_worker(args)
         self.assertEqual(payload["usage"], {"input_tokens": 30, "output_tokens": 5})
+        self.assertEqual(payload["accepted_usage"], {"input_tokens": 20, "output_tokens": 3})
 
     def test_valid_json_without_task_activity_is_not_accepted(self):
         response = '{"status":"success","summary":"guessed","files_changed":[],"tests":[],"risks":[]}'

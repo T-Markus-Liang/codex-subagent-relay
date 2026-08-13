@@ -27,7 +27,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.10"
+VERSION = "0.10.11"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1325,6 +1325,7 @@ def record_run(
         "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
         "attempt_failure_categories": list(payload.get("attempt_failure_categories") or []),
         "usage": payload.get("usage", {}),
+        "accepted_usage": payload.get("accepted_usage", {}),
     }
     RUN_LOG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
@@ -1943,6 +1944,7 @@ def _run_worker_locked(
     message: dict[str, Any] | None = None
     usage: dict[str, int] = {}
     total_usage: dict[str, int] = {}
+    accepted_usage: dict[str, int] = {}
     side_effect_attempt: dict[str, Any] | None = None
     accepted = False
     used_stream_retry = False
@@ -1993,6 +1995,7 @@ def _run_worker_locked(
                     and stream["failure"] is None
                 ):
                     accepted = True
+                    accepted_usage = dict(usage)
                     break
                 attempt_label = provider if stream_retry_count == 0 else f"{provider} retry"
                 category = attempt_failure_category(
@@ -2050,6 +2053,7 @@ def _run_worker_locked(
                 f"{side_effect_attempt['provider']}: {attempts[-1]['error']}",
             ],
             "usage": total_usage,
+            "accepted_usage": accepted_usage,
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
@@ -2067,6 +2071,7 @@ def _run_worker_locked(
             "tests": [],
             "risks": ["all DeepSeek providers failed", *[f"{item['provider']}: {item['error']}" for item in attempts]],
             "usage": total_usage,
+            "accepted_usage": accepted_usage,
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
@@ -2086,6 +2091,7 @@ def _run_worker_locked(
             + (["bounded same-provider stream retry was used"] if used_stream_retry else [])
             + (["provider fallback was used after an earlier DeepSeek route failed"] if attempt_index > 0 else []),
             "usage": total_usage,
+            "accepted_usage": accepted_usage,
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,

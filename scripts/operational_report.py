@@ -12,6 +12,13 @@ from typing import Any
 
 
 DEFAULT_LOG = Path.home() / ".codex" / "deepseek-worker-runs.jsonl"
+USAGE_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
@@ -20,6 +27,21 @@ def percentile(values: list[float], fraction: float) -> float | None:
     ordered = sorted(values)
     index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
     return round(ordered[index], 2)
+
+
+def usage_totals(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
+    totals = {key: 0 for key in USAGE_KEYS}
+    for row in rows:
+        usage = row.get(field)
+        if not isinstance(usage, dict):
+            continue
+        for key in USAGE_KEYS:
+            value = usage.get(key, 0)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] += value
+    totals["request_tokens"] = totals["input_tokens"] + totals["output_tokens"]
+    totals["context_tokens"] = totals["request_tokens"] + totals["cached_input_tokens"] + totals["cache_write_input_tokens"]
+    return totals
 
 
 def read_rows(path: Path, cutoff: datetime) -> tuple[list[dict[str, Any]], int]:
@@ -48,7 +70,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     statuses: dict[str, int] = defaultdict(int)
     attempt_failure_categories: dict[str, int] = defaultdict(int)
     durations: list[float] = []
-    success = fallback = partial = retried = blocked = 0
+    success = fallback = partial = retried = blocked = accepted_usage_rows = 0
     for row in rows:
         status = str(row.get("status") or "unknown")
         statuses[status] += 1
@@ -57,6 +79,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         fallback += int(bool(row.get("fallback_used")))
         partial += int(bool(row.get("partial_write")))
         retried += int(int(row.get("stream_retry_count") or 0) > 0)
+        accepted_usage_rows += int("accepted_usage" in row)
         categories = row.get("attempt_failure_categories")
         if isinstance(categories, list):
             for category in categories:
@@ -78,6 +101,15 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "stream_retry_runs": retried,
         "blocked_runs": blocked,
         "attempt_failure_category_counts": dict(sorted(attempt_failure_categories.items())),
+        "usage": {
+            "attempt_usage": usage_totals(rows, "usage"),
+            "accepted_success_usage": usage_totals(rows, "accepted_usage"),
+            "accepted_usage_coverage": {
+                "rows_with_field": accepted_usage_rows,
+                "rows_missing_field": len(rows) - accepted_usage_rows,
+                "note": "accepted_success_usage counts only the accepted final Provider attempt; it excludes failed and retried attempts.",
+            },
+        },
     }
 
 
@@ -128,7 +160,7 @@ def report(
         "providers": {key: summarize(value) for key, value in sorted(by_provider.items())},
         "run_types": {key: summarize(value) for key, value in sorted(by_run_type.items())},
         "coverage_warning": (
-            "Relay telemetry is operational evidence only. Do not add its token or run totals to Codex Rollout or CC Switch ledgers; use the separate codex-usage-audit workflow for those sources."
+            "Relay telemetry is operational evidence only. attempt_usage includes failed and retried Provider attempts; accepted_success_usage is Relay-local productive usage only when its field is present. Do not add either to Codex Rollout or CC Switch ledgers; use the separate codex-usage-audit workflow for those sources."
         ),
     }
 

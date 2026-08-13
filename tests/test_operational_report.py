@@ -57,6 +57,22 @@ class OperationalReportTests(unittest.TestCase):
         self.assertEqual(payload["rows_excluded_by_filters"], 3)
         self.assertEqual(payload["filters"], {"relay_version": "0.10.9", "run_type": "external_run", "telemetry_scope": "production", "since": "2026-08-13T00:00:00+00:00"})
 
+    def test_usage_separates_all_attempts_from_accepted_final_attempts(self):
+        now = datetime(2026, 8, 14, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            rows = [
+                {"timestamp": "2026-08-13T00:00:00+00:00", "status": "success", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 10, "usage": {"input_tokens": 30, "output_tokens": 4}, "accepted_usage": {"input_tokens": 20, "output_tokens": 3}},
+                {"timestamp": "2026-08-13T01:00:00+00:00", "status": "error", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 20, "usage": {"input_tokens": 10, "output_tokens": 2}, "accepted_usage": {}},
+                {"timestamp": "2026-08-13T02:00:00+00:00", "status": "success", "provider": "legacy", "run_type": "external_run", "duration_seconds": 5, "usage": {"input_tokens": 99, "output_tokens": 9}},
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            payload = module.report(path, 7, now)
+        usage = payload["overall"]["usage"]
+        self.assertEqual(usage["attempt_usage"]["request_tokens"], 154)
+        self.assertEqual(usage["accepted_success_usage"]["request_tokens"], 23)
+        self.assertEqual(usage["accepted_usage_coverage"], {"rows_with_field": 2, "rows_missing_field": 1, "note": "accepted_success_usage counts only the accepted final Provider attempt; it excludes failed and retried attempts."})
+
 
 if __name__ == "__main__":
     unittest.main()
