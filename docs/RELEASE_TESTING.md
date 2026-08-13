@@ -21,7 +21,8 @@ It must pass completely. It verifies:
 - Concurrent `launch -> poll` job identity and output-file isolation.
 - Durable job lifecycle: atomic metadata/results/manifests, idempotent launch reuse, cancellation,
   stale-PID recovery, timeout/partial-write terminalization without automatic replay, and explicit
-  dry-run-first retention cleanup that never deletes active jobs.
+  dry-run-first retention cleanup that never deletes active jobs. Earlier flat job artifacts are
+  observable and archive-only; they are never silently deleted or fabricated into resumable jobs.
 - Run metadata excludes task text and secret-like result content.
 - Real workspace changes stop automatic retry and Provider fallback.
 - Native canaries remain evidence-only and must never promote a production route automatically.

@@ -3,7 +3,7 @@
 PYTHON ?= python3.11
 
 audit:
-	$(PYTHON) -m py_compile deepseek-worker scripts/live_soak.py scripts/qualify_manifest.py plugins/codex-subagent-relay/mcp/server.py scripts/validate_compatibility.py scripts/validate_plugin_package.py tests/test_worker.py tests/test_release_gate.py tests/test_install.py tests/test_live_soak.py tests/test_mcp.py tests/test_compatibility.py tests/test_marketplace.py tests/test_qualify_manifest.py
+	$(PYTHON) -m py_compile deepseek-worker relay_runtime/job_store.py scripts/live_soak.py scripts/qualify_manifest.py plugins/codex-subagent-relay/mcp/server.py scripts/validate_compatibility.py scripts/validate_plugin_package.py tests/test_worker.py tests/test_release_gate.py tests/test_install.py tests/test_live_soak.py tests/test_mcp.py tests/test_compatibility.py tests/test_marketplace.py tests/test_qualify_manifest.py
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v

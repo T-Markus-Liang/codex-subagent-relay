@@ -86,6 +86,11 @@ deletes queued or running jobs, and skips malformed job directories instead of g
 are safe to remove. Retention is local operational hygiene; it does not alter Codex state, threads,
 Provider configuration, or run-log aggregation.
 
+Flat `*.json` records created by pre-runtime Worker releases are never silently deleted. They are
+counted by `list` and reported as `legacy` artifacts. `cleanup --legacy-action archive` previews
+their movement; adding `--apply` moves only verified inactive artifacts into
+`~/.codex/deepseek-worker-jobs/legacy/`. It does not transform them into modern resumable jobs.
+
 ## Automatic Provider Circuit
 
 Automatic runs persist a small private circuit state file at `~/.codex/deepseek-worker-circuit.json`, protected by a local lock and atomically replaced. After two no-side-effect failures for one Provider, that Provider is skipped for 30 seconds. A successful run clears its state. Explicit `--provider` runs bypass the circuit for diagnostics and recovery. If the state file cannot be read or written, routing fails open and continues normally. A write-side effect never triggers automatic replay or Provider fallback.

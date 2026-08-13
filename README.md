@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.1.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.2.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -104,6 +104,7 @@ deepseek-worker --json list --limit 20
 deepseek-worker --json inspect --job-id <job_id>
 deepseek-worker --json cleanup --retention-hours 168
 deepseek-worker --json cleanup --retention-hours 168 --apply
+deepseek-worker --json cleanup --retention-hours 168 --legacy-action archive
 ```
 
 Every accepted terminal result has this exact core contract:
@@ -133,6 +134,12 @@ The relay adds bounded metadata such as Provider, duration, usage, and stream re
 Terminal job artifacts are retained for seven days by default. Cleanup is a dry run unless
 `--apply` is supplied; it never deletes queued/running jobs, malformed directories, or jobs completed
 inside the specified retention window. Review the candidate IDs before applying cleanup.
+
+Earlier Worker releases stored flat `<job-id>.json` records in the job root. Current `list` reports
+them as `legacy` using only safe lifecycle fields; `inspect` is read-only and they cannot be resumed.
+Normal cleanup leaves them untouched. First preview `cleanup --legacy-action archive`, then add
+`--apply` to move verified inactive records to the private `legacy/` directory. This never deletes or
+converts historical artifacts.
 
 Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. It reports overall plus role/Provider success rates, p50/p95 duration, fallback, partial-write, and stream-retry counts. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
 

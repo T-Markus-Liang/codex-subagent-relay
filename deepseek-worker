@@ -24,8 +24,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from relay_runtime.job_store import JobStore
 
-VERSION = "0.10.1"
+
+VERSION = "0.10.2"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -61,6 +63,15 @@ MAX_TERMINAL_JOB_RETENTION_HOURS = 24 * 365
 
 class WorkerError(RuntimeError):
     pass
+
+
+def valid_job_id(job_id: str) -> bool:
+    return bool(job_id) and all(char in "0123456789abcdef-" for char in job_id)
+
+
+def job_store() -> JobStore:
+    """Create storage on demand so tests and isolated homes can replace JOB_ROOT."""
+    return JobStore(JOB_ROOT, valid_job_id)
 
 
 def load_runtime_config(path: Path = RUNTIME_CONFIG_PATH) -> dict[str, Any]:
@@ -1248,18 +1259,17 @@ def record_run(payload: dict[str, Any], run_type: str = "external_run") -> None:
 
 def job_paths(job_id: str) -> tuple[Path, Path, Path]:
     """Compatibility paths for a job's durable metadata and transient process output."""
-    if not job_id or any(char not in "0123456789abcdef-" for char in job_id):
-        raise WorkerError("invalid worker job id")
-    return (
-        JOB_ROOT / job_id / "meta.json",
-        JOB_ROOT / job_id / "stdout.jsonl",
-        JOB_ROOT / job_id / "stderr.log",
-    )
+    try:
+        return job_store().paths(job_id)
+    except ValueError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 def job_artifact_path(job_id: str, name: str) -> Path:
-    metadata_path, _stdout_path, _stderr_path = job_paths(job_id)
-    return metadata_path.parent / name
+    try:
+        return job_store().artifact_path(job_id, name)
+    except ValueError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 def job_state_for_payload(payload: dict[str, Any]) -> str:
@@ -1273,14 +1283,10 @@ def job_state_for_payload(payload: dict[str, Any]) -> str:
 
 
 def read_job_metadata(job_id: str) -> dict[str, Any]:
-    metadata_path, _stdout_path, _stderr_path = job_paths(job_id)
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkerError(f"worker job not found: {type(exc).__name__}") from exc
-    if not isinstance(metadata, dict) or metadata.get("job_id") != job_id:
-        raise WorkerError("invalid worker job metadata")
-    return metadata
+        return job_store().read_modern_metadata(job_id)
+    except ValueError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 def update_job_metadata(job_id: str, **updates: Any) -> dict[str, Any]:
@@ -1301,16 +1307,8 @@ def idempotency_digest(key: str | None) -> str | None:
 
 def find_idempotent_job(key_digest: str, workdir: Path) -> dict[str, Any] | None:
     """Return a prior job for the same opaque key and workdir without persisting key text."""
-    try:
-        directories = list(JOB_ROOT.iterdir())
-    except OSError:
-        return None
-    for directory in directories:
-        metadata_path = directory / "meta.json"
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
+    records, _invalid = job_store().modern_metadata()
+    for metadata in records:
         if (
             isinstance(metadata, dict)
             and metadata.get("idempotency_key_sha256") == key_digest
@@ -1330,13 +1328,7 @@ def idempotency_lock(key_digest: str):
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".worker-job-", delete=False) as handle:
-        json.dump(payload, handle, separators=(",", ":"))
-        handle.write("\n")
-        temporary = Path(handle.name)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    job_store().write_json(path, payload)
 
 
 def append_job_event(job_id: str, event: str, state: str, **details: Any) -> None:
@@ -1639,27 +1631,49 @@ def job_public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return {field: metadata[field] for field in fields if field in metadata}
 
 
+def legacy_job_public_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    """Expose only safe legacy facts; flat artifacts cannot be polled or resumed."""
+    metadata = record["metadata"]
+    return {
+        "job_id": record["job_id"],
+        "schema_version": 0,
+        "state": "legacy",
+        "created_at": metadata.get("started_at"),
+        "role": metadata.get("role") if isinstance(metadata.get("role"), str) else None,
+        "provider": metadata.get("provider") if isinstance(metadata.get("provider"), str) else None,
+        "legacy_action": "archive-only",
+    }
+
+
 def list_jobs(limit: int = 20) -> dict[str, Any]:
     if not 1 <= limit <= 100:
         raise WorkerError("job list limit must be between 1 and 100")
-    jobs: list[dict[str, Any]] = []
-    try:
-        directories = list(JOB_ROOT.iterdir())
-    except OSError:
-        directories = []
-    for directory in directories:
-        try:
-            metadata = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(metadata, dict) and isinstance(metadata.get("job_id"), str):
-            jobs.append(job_public_metadata(metadata))
+    modern, invalid_modern = job_store().modern_metadata()
+    legacy, invalid_legacy = job_store().legacy_metadata()
+    jobs = [job_public_metadata(metadata) for metadata in modern]
+    jobs.extend(legacy_job_public_metadata(record) for record in legacy)
     jobs.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
-    return {"status": "success", "jobs": jobs[:limit]}
+    return {
+        "status": "success",
+        "jobs": jobs[:limit],
+        "legacy": {"count": len(legacy), "action": "archive-only", "invalid_artifacts": invalid_legacy},
+        "invalid_modern_job_directories": invalid_modern,
+    }
 
 
 def inspect_job(job_id: str) -> dict[str, Any]:
-    metadata = read_job_metadata(job_id)
+    try:
+        metadata = read_job_metadata(job_id)
+    except WorkerError:
+        legacy, _invalid = job_store().legacy_metadata()
+        record = next((item for item in legacy if item["job_id"] == job_id), None)
+        if record is None:
+            raise
+        return {
+            "status": "success",
+            "job": legacy_job_public_metadata(record),
+            "legacy_note": "This pre-runtime artifact is read-only and cannot be polled, cancelled, or resumed.",
+        }
     payload: dict[str, Any] = {"status": "success", "job": job_public_metadata(metadata)}
     for artifact in ("before.json", "after.json", "result.json", "diagnostic.json"):
         try:
@@ -1688,28 +1702,20 @@ def terminal_job_finished_at(metadata: dict[str, Any]) -> datetime | None:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def cleanup_terminal_jobs(retention_hours: float, apply: bool = False) -> dict[str, Any]:
-    """Preview or remove only expired terminal directories under the private job root."""
+def cleanup_terminal_jobs(retention_hours: float, apply: bool = False, legacy_action: str = "report") -> dict[str, Any]:
+    """Preview or remove expired modern jobs; legacy files need an explicit archive action."""
     if not 0 <= retention_hours <= MAX_TERMINAL_JOB_RETENTION_HOURS:
         raise WorkerError(f"retention hours must be between 0 and {MAX_TERMINAL_JOB_RETENTION_HOURS}")
+    if legacy_action not in {"report", "archive"}:
+        raise WorkerError("legacy action must be report or archive")
     cutoff = datetime.now(UTC) - timedelta(hours=retention_hours)
     candidates: list[str] = []
-    skipped = {"active": 0, "invalid": 0, "recent": 0}
-    try:
-        directories = list(JOB_ROOT.iterdir())
-    except OSError:
-        directories = []
-    for directory in directories:
-        if not directory.is_dir() or directory.name == "idempotency":
-            continue
-        try:
-            metadata = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            skipped["invalid"] += 1
-            continue
-        if not isinstance(metadata, dict) or metadata.get("job_id") != directory.name:
-            skipped["invalid"] += 1
-            continue
+    skipped = {"active": 0, "invalid": 0, "recent": 0, "legacy": 0}
+    modern, invalid_modern = job_store().modern_metadata()
+    legacy, invalid_legacy = job_store().legacy_metadata()
+    skipped["invalid"] = invalid_modern + invalid_legacy
+    skipped["legacy"] = len(legacy)
+    for metadata in modern:
         finished_at = terminal_job_finished_at(metadata)
         if finished_at is None:
             skipped["active"] += 1
@@ -1717,7 +1723,7 @@ def cleanup_terminal_jobs(retention_hours: float, apply: bool = False) -> dict[s
         if finished_at > cutoff:
             skipped["recent"] += 1
             continue
-        candidates.append(directory.name)
+        candidates.append(str(metadata["job_id"]))
     removed: list[str] = []
     if apply:
         for job_id in candidates:
@@ -1737,12 +1743,31 @@ def cleanup_terminal_jobs(retention_hours: float, apply: bool = False) -> dict[s
                 removed.append(job_id)
             except OSError:
                 skipped["invalid"] += 1
+    archived_legacy_job_ids: list[str] = []
+    if legacy_action == "archive" and apply:
+        for record in legacy:
+            metadata = record["metadata"]
+            pid = metadata.get("pid")
+            if isinstance(pid, int) and process_is_running(pid):
+                skipped["active"] += 1
+                continue
+            try:
+                job_store().archive_legacy(record)
+                archived_legacy_job_ids.append(record["job_id"])
+            except (OSError, ValueError):
+                skipped["invalid"] += 1
     return {
         "status": "success",
         "retention_hours": retention_hours,
         "dry_run": not apply,
         "candidate_job_ids": candidates,
         "removed_job_ids": removed,
+        "legacy": {
+            "action": legacy_action,
+            "dry_run": not apply,
+            "candidate_job_ids": [record["job_id"] for record in legacy] if legacy_action == "archive" else [],
+            "archived_job_ids": archived_legacy_job_ids,
+        },
         "skipped": skipped,
     }
 
@@ -2761,6 +2786,12 @@ def parser() -> argparse.ArgumentParser:
     cleanup_parser = commands.add_parser("cleanup", help="Preview or remove expired terminal job artifacts; active jobs are always retained.")
     cleanup_parser.add_argument("--retention-hours", type=float, default=DEFAULT_TERMINAL_JOB_RETENTION_HOURS)
     cleanup_parser.add_argument("--apply", action="store_true", help="Actually delete eligible terminal job directories. Omit for a dry run.")
+    cleanup_parser.add_argument(
+        "--legacy-action",
+        choices=("report", "archive"),
+        default="report",
+        help="Keep flat legacy artifacts reported by default; archive moves them into a private legacy directory only with --apply.",
+    )
 
     smoke_parser = commands.add_parser("smoke-test", help="Run a tiny read-only live task through one provider.")
     smoke_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
@@ -2817,7 +2848,7 @@ def main() -> int:
         elif args.command == "inspect":
             payload = inspect_job(args.job_id)
         elif args.command == "cleanup":
-            payload = cleanup_terminal_jobs(args.retention_hours, args.apply)
+            payload = cleanup_terminal_jobs(args.retention_hours, args.apply, args.legacy_action)
         elif args.command == "smoke-test":
             run_args = argparse.Namespace(
                 task="Inspect the current directory without modifying files. Reply with a short success summary.",

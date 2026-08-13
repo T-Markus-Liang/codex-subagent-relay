@@ -227,6 +227,47 @@ class RouterTests(unittest.TestCase):
         with self.assertRaises(module.WorkerError):
             module.cleanup_terminal_jobs(module.MAX_TERMINAL_JOB_RETENTION_HOURS + 1)
 
+    def test_legacy_flat_artifacts_are_visible_but_not_treated_as_runnable_jobs(self):
+        with tempfile.TemporaryDirectory() as jobs:
+            legacy_id = "1700000000-abcdef123456"
+            legacy_path = Path(jobs) / f"{legacy_id}.json"
+            legacy_path.write_text(json.dumps({
+                "job_id": legacy_id,
+                "pid": 999999,
+                "started_at": "2026-08-01T00:00:00+00:00",
+                "role": "repository-exploration",
+                "provider": "sensenova",
+                "workdir": "/private/legacy-workdir",
+                "task": "must not escape list output",
+            }), encoding="utf-8")
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                listed = module.list_jobs()
+                inspected = module.inspect_job(legacy_id)
+                cleanup = module.cleanup_terminal_jobs(0)
+            rendered = json.dumps({"listed": listed, "inspected": inspected, "cleanup": cleanup})
+            self.assertEqual(listed["legacy"]["count"], 1)
+            self.assertEqual(listed["jobs"][0]["state"], "legacy")
+            self.assertEqual(inspected["job"]["legacy_action"], "archive-only")
+            self.assertEqual(cleanup["skipped"]["legacy"], 1)
+            self.assertNotIn("/private/legacy-workdir", rendered)
+            self.assertNotIn("must not escape", rendered)
+            self.assertFalse((Path(jobs) / "legacy").exists())
+
+    def test_legacy_archive_requires_explicit_action_and_apply(self):
+        with tempfile.TemporaryDirectory() as jobs:
+            legacy_id = "1700000000-abcdef123456"
+            legacy_path = Path(jobs) / f"{legacy_id}.json"
+            legacy_path.write_text(json.dumps({"job_id": legacy_id, "pid": 999999}), encoding="utf-8")
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                dry_run = module.cleanup_terminal_jobs(0, legacy_action="archive")
+                self.assertTrue((Path(jobs) / f"{legacy_id}.json").is_file())
+                with patch.object(module, "process_is_running", return_value=False):
+                    applied = module.cleanup_terminal_jobs(0, apply=True, legacy_action="archive")
+            self.assertEqual(dry_run["legacy"]["candidate_job_ids"], [legacy_id])
+            self.assertEqual(applied["legacy"]["archived_job_ids"], [legacy_id])
+            self.assertFalse((Path(jobs) / f"{legacy_id}.json").exists())
+            self.assertTrue((Path(jobs) / "legacy" / f"{legacy_id}.json").is_file())
+
     def test_cancel_marks_job_without_replaying_and_preserves_changes(self):
         with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as jobs:
             job_id = "1700000000-abcdef123456"
