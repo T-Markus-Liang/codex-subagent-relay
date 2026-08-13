@@ -1033,6 +1033,22 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["usage"], {"input_tokens": 30, "output_tokens": 5})
         self.assertEqual(payload["accepted_usage"], {"input_tokens": 20, "output_tokens": 3})
 
+    def test_partial_contract_usage_is_not_counted_as_accepted_success_usage(self):
+        response = '{"status":"partial","summary":"needs review","files_changed":[],"tests":[],"risks":["incomplete"]}'
+        events = [
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "pwd", "status": "completed"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": response}},
+            {"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 3}},
+        ]
+        completed = module.subprocess.CompletedProcess([], 0, "\n".join(map(json.dumps, events)), "")
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="auto", timeout=90, no_record=True)
+            with patch.object(module, "invoke_codex", return_value=completed):
+                payload = module.run_worker(args)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["usage"], {"input_tokens": 20, "output_tokens": 3})
+        self.assertEqual(payload["accepted_usage"], {})
+
     def test_valid_json_without_task_activity_is_not_accepted(self):
         response = '{"status":"success","summary":"guessed","files_changed":[],"tests":[],"risks":[]}'
         no_tools = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}}) + "\n"

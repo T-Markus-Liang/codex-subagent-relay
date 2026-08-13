@@ -71,7 +71,7 @@ class OperationalReportTests(unittest.TestCase):
         usage = payload["overall"]["usage"]
         self.assertEqual(usage["attempt_usage"]["request_tokens"], 154)
         self.assertEqual(usage["accepted_success_usage"]["request_tokens"], 23)
-        self.assertEqual(usage["accepted_usage_coverage"], {"rows_with_field": 2, "rows_missing_field": 1, "note": "accepted_success_usage counts only the accepted final Provider attempt; it excludes failed and retried attempts."})
+        self.assertEqual(usage["accepted_usage_coverage"], {"rows_with_field": 2, "rows_missing_field": 1, "note": "accepted_success_usage counts only final Provider attempts with status success; it excludes failed, partial, and retried attempts."})
 
     def test_future_since_is_rejected(self):
         now = datetime(2026, 8, 14, tzinfo=UTC)

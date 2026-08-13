@@ -123,7 +123,7 @@ For the required seven-day operational observation, generate a source-local UTC 
 each day and preserve only the redacted aggregate report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.11 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.12 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```

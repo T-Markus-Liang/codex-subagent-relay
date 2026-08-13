@@ -107,7 +107,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "accepted_usage_coverage": {
                 "rows_with_field": accepted_usage_rows,
                 "rows_missing_field": len(rows) - accepted_usage_rows,
-                "note": "accepted_success_usage counts only the accepted final Provider attempt; it excludes failed and retried attempts.",
+                "note": "accepted_success_usage counts only final Provider attempts with status success; it excludes failed, partial, and retried attempts.",
             },
         },
     }

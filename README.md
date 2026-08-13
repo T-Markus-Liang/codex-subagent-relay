@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.11.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.12.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -132,7 +132,7 @@ Every accepted terminal result has this exact core contract:
 }
 ```
 
-The relay adds bounded metadata such as Provider, duration, usage, and stream retry count. `usage` is all Provider-attempt usage, including failures and safe retries; `accepted_usage` contains only the final Provider attempt that passed the strict result contract, and is empty for errors or partial writes. Independently inspect `files_changed`, `git diff`, and the listed tests before accepting any write.
+The relay adds bounded metadata such as Provider, duration, usage, and stream retry count. `usage` is all Provider-attempt usage, including failures and safe retries; `accepted_usage` contains only the final Provider attempt that finished with `status: success` under the strict result contract, and is empty for errors or partial writes. Independently inspect `files_changed`, `git diff`, and the listed tests before accepting any write.
 
 ## Routing And Safety
 
@@ -159,7 +159,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.11 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.12 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
