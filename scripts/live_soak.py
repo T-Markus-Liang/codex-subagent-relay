@@ -21,6 +21,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--poll-seconds", type=float, default=2.0, help="Delay between durable job polls.")
     parser.add_argument("--job-deadline", type=float, default=180.0, help="Maximum wall-clock seconds for one launch/poll job.")
+    parser.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=0,
+        help="Stop after this many consecutive non-success attempts; 0 runs the whole requested batch.",
+    )
     parser.add_argument("--report", type=Path, required=True)
     return parser.parse_args()
 
@@ -72,6 +78,16 @@ def percentile(values: list[float], fraction: float) -> float | None:
     ordered = sorted(values)
     index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
     return round(ordered[index], 2)
+
+
+def consecutive_failure_stop(records: list[dict], limit: int) -> str | None:
+    """Return a bounded diagnostic reason without weakening qualification acceptance."""
+    if limit <= 0 or len(records) < limit:
+        return None
+    recent = records[-limit:]
+    if all(record.get("status") != "success" or not record.get("expected_output") for record in recent):
+        return f"{limit} consecutive non-success attempts"
+    return None
 
 
 def cancel_job(worker: str, job_id: str) -> dict:
@@ -141,11 +157,14 @@ def main() -> int:
         raise SystemExit("refusing live calls without --confirm-live")
     if args.runs < 1 or args.runs > 1000:
         raise SystemExit("--runs must be between 1 and 1000")
+    if args.max_consecutive_failures < 0:
+        raise SystemExit("--max-consecutive-failures must be zero or positive")
     if not shutil.which(args.worker) and not Path(args.worker).is_file():
         raise SystemExit("worker command not found")
 
     records = []
     interrupted = False
+    early_stop_reason = None
     for index in range(1, args.runs + 1):
         try:
             with tempfile.TemporaryDirectory(prefix="deepseek-worker-soak-") as temporary_dir:
@@ -168,6 +187,9 @@ def main() -> int:
                     "expected_output": expected_output,
                     "failure_class": failure_class(payload, workspace_reason),
                 })
+                early_stop_reason = consecutive_failure_stop(records, args.max_consecutive_failures)
+                if early_stop_reason:
+                    break
         except KeyboardInterrupt:
             interrupted = True
             break
@@ -182,6 +204,7 @@ def main() -> int:
         "runs": len(records),
         "requested_runs": args.runs,
         "interrupted": interrupted,
+        "early_stop_reason": early_stop_reason,
         "successes": successes,
         "success_rate_percent": round(100 * successes / len(records), 2) if records else 0.0,
         "p50_duration_seconds": percentile(durations, 0.5),

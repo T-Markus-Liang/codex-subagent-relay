@@ -46,6 +46,17 @@ class LiveSoakTests(unittest.TestCase):
         self.assertEqual(module.failure_class({"status": "error", "stream_finish_reason": "length"}, "ok"), "stream:length")
         self.assertIsNone(module.failure_class({"status": "success"}, "ok"))
 
+    def test_consecutive_failure_stop_requires_only_recent_non_successes(self):
+        failed = {"status": "error", "expected_output": False}
+        succeeded = {"status": "success", "expected_output": True}
+        self.assertIsNone(module.consecutive_failure_stop([failed, failed], 3))
+        self.assertEqual(
+            module.consecutive_failure_stop([succeeded, failed, failed, failed], 3),
+            "3 consecutive non-success attempts",
+        )
+        self.assertIsNone(module.consecutive_failure_stop([failed, succeeded, failed], 2))
+        self.assertIsNone(module.consecutive_failure_stop([failed, failed], 0))
+
     def test_run_job_launches_then_polls_the_same_durable_job(self):
         class Completed:
             def __init__(self, stdout):

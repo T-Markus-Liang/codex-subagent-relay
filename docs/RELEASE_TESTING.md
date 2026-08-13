@@ -77,6 +77,11 @@ python3.11 scripts/live_soak.py --confirm-live --provider auto --role documentat
   --runs 30 --report reports/phase0-auto-write-30.json
 ```
 
+When an upstream is visibly unhealthy, add `--max-consecutive-failures 3` to preserve a bounded
+failed-evidence report and stop consuming qualification quota after three consecutive non-success
+attempts. The stopped report is not qualifying evidence: it remains below the required job count.
+Use `0` (the default) only when deliberately completing a full diagnostic batch.
+
 For publication qualification, repeat with `--runs 100` for each production role and separately use explicit Provider runs only as diagnostic controls. Use `--job-deadline 180` (or a reviewed larger bound) so a long upstream call cannot leave the batch unbounded; interruption cancels the same durable job and writes a partial report. The tracked compatibility manifest and `scripts/validate_compatibility.py --require-evidence` define the publication contract for every production route. The report contains aggregate metrics plus bounded per-run status, selected Provider, terminal safety fields, and no prompt, workspace path, request, response, or credential data. A nonzero exit means at least one run did not complete or violated workspace verification.
 
 After a route's explicit reports pass, generate a candidate manifest instead of editing the tracked
