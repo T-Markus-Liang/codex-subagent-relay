@@ -1,7 +1,9 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/live_soak.py"
@@ -36,6 +38,23 @@ class LiveSoakTests(unittest.TestCase):
         self.assertEqual(module.failure_class({"status": "success"}, "write content mismatch"), "write content mismatch")
         self.assertEqual(module.failure_class({"status": "error", "stream_finish_reason": "length"}, "ok"), "stream:length")
         self.assertIsNone(module.failure_class({"status": "success"}, "ok"))
+
+    def test_run_job_launches_then_polls_the_same_durable_job(self):
+        class Completed:
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        responses = iter([
+            Completed(json.dumps({"status": "running", "job_id": "job-1"})),
+            Completed(json.dumps({"status": "running", "job_id": "job-1"})),
+            Completed(json.dumps({"status": "success", "job_id": "job-1"})),
+        ])
+        with patch.object(module.subprocess, "run", side_effect=lambda *args, **kwargs: next(responses)) as run, \
+             patch.object(module.time, "sleep"):
+            payload, _duration = module.run_job("worker", ["--role", "documentation"], 0.1)
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(run.call_args_list[0].args[0][:3], ["worker", "--json", "launch"])
+        self.assertEqual(run.call_args_list[1].args[0], ["worker", "--json", "poll", "--job-id", "job-1"])
 
 
 if __name__ == "__main__":

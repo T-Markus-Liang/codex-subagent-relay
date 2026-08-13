@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--role", choices=("repository-exploration", "documentation"), required=True)
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=0)
+    parser.add_argument("--poll-seconds", type=float, default=2.0, help="Delay between durable job polls.")
     parser.add_argument("--report", type=Path, required=True)
     return parser.parse_args()
 
@@ -71,6 +72,26 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[index], 2)
 
 
+def run_job(worker: str, command: list[str], poll_seconds: float) -> tuple[dict, float]:
+    """Drive the durable lifecycle so a long Provider call is never tied to one shell session."""
+    started = time.monotonic()
+    launched = subprocess.run([worker, "--json", "launch", *command], text=True, capture_output=True, check=False)
+    try:
+        launch_payload = json.loads(launched.stdout)
+        job_id = str(launch_payload["job_id"])
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return {"status": "invalid-output"}, round(time.monotonic() - started, 2)
+    while True:
+        polled = subprocess.run([worker, "--json", "poll", "--job-id", job_id], text=True, capture_output=True, check=False)
+        try:
+            payload = json.loads(polled.stdout)
+        except json.JSONDecodeError:
+            payload = {"status": "invalid-output"}
+        if payload.get("status") != "running":
+            return payload, round(time.monotonic() - started, 2)
+        time.sleep(max(0.1, poll_seconds))
+
+
 def main() -> int:
     args = parse_args()
     if not args.confirm_live:
@@ -84,9 +105,6 @@ def main() -> int:
     for index in range(1, args.runs + 1):
         with tempfile.TemporaryDirectory(prefix="deepseek-worker-soak-") as temporary_dir:
             command = [
-                args.worker,
-                "--json",
-                "run",
                 "--role",
                 args.role,
                 "--workdir",
@@ -99,13 +117,7 @@ def main() -> int:
                 "--task",
                 task_for(args.role),
             ]
-            started = time.monotonic()
-            completed = subprocess.run(command, text=True, capture_output=True, check=False)
-            duration = round(time.monotonic() - started, 2)
-            try:
-                payload = json.loads(completed.stdout)
-            except json.JSONDecodeError:
-                payload = {"status": "invalid-output"}
+            payload, duration = run_job(args.worker, command, args.poll_seconds)
             workspace_ok, workspace_reason = verify_workspace(Path(temporary_dir), args.role)
             records.append(
                 {
