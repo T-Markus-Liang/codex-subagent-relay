@@ -55,7 +55,7 @@ class RouterTests(unittest.TestCase):
         self.assertIs(popen.call_args.kwargs["stdin"], module.subprocess.DEVNULL)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
-    def test_launched_job_child_inherits_the_job_process_group(self):
+    def test_launched_job_provider_has_its_own_group_for_safe_timeout(self):
         class DummyProcess:
             pid = 123
             returncode = 0
@@ -65,9 +65,9 @@ class RouterTests(unittest.TestCase):
 
         with patch.object(module.subprocess, "Popen", return_value=DummyProcess()) as popen:
             module.invoke_codex(["opencode", "run"], Path.cwd(), 5, env={"DEEPSEEK_WORKER_LAUNCHED": "1"})
-        self.assertFalse(popen.call_args.kwargs["start_new_session"])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
-    def test_launched_job_timeout_signals_the_inherited_group_leader(self):
+    def test_launched_job_timeout_signals_only_provider_group(self):
         class DummyProcess:
             pid = 123
             returncode = 0
@@ -80,11 +80,17 @@ class RouterTests(unittest.TestCase):
                 return "", ""
 
         with patch.object(module.subprocess, "Popen", return_value=DummyProcess()), \
-             patch.object(module.os, "getpgrp", return_value=456), \
              patch.object(module.os, "killpg") as killpg:
             result = module.invoke_codex(["opencode", "run"], Path.cwd(), 5, env={"DEEPSEEK_WORKER_LAUNCHED": "1"})
         self.assertEqual(result.returncode, 124)
-        killpg.assert_called_once_with(456, module.signal.SIGTERM)
+        killpg.assert_called_once_with(123, module.signal.SIGTERM)
+
+    def test_cancellation_stops_worker_and_active_provider_groups(self):
+        metadata = {"pid": 100, "active_provider_pid": 200}
+        with patch.object(module, "terminate_process_group", side_effect=[True, True]) as terminate:
+            self.assertTrue(module.terminate_job_processes(metadata))
+        self.assertEqual(terminate.call_args_list[0].args, (100,))
+        self.assertEqual(terminate.call_args_list[1].args, (200,))
 
     def test_launch_and_poll_use_nonblocking_job_files(self):
         class DummyProcess:
@@ -274,6 +280,11 @@ class RouterTests(unittest.TestCase):
         self.assertIn('{"status":"success","summary":"concise result","files_changed":[],"tests":[],"risks":[]}', prompt)
         self.assertIn("no Markdown fence or surrounding prose", prompt)
         self.assertIn('never use 0, null, or the string "none"', prompt)
+
+    def test_write_worker_prompt_requires_actual_changed_paths(self):
+        prompt = module.worker_prompt("write one file", "documentation")
+        self.assertIn('"files_changed":["relative/path-you-actually-changed"]', prompt)
+        self.assertIn("empty list after a write is invalid", prompt)
 
     def test_opencode_command_targets_requested_workdir(self):
         invalid = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "starting"}}) + "\n"

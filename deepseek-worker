@@ -463,6 +463,13 @@ def effective_timeout(requested_timeout: int, role: str) -> int:
 
 
 def worker_prompt(task: str, role: str) -> str:
+    write_task = normalize_role(role) not in READ_ONLY_ROLES
+    result_example = '["relative/path-you-actually-changed"]' if write_task else '[]'
+    change_instruction = (
+        "For files_changed, list every actual relative path you changed; an empty list after a write is invalid."
+        if write_task
+        else "For files_changed, use [] because this is read-only."
+    )
     return f"""You are a bounded DeepSeek execution worker.
 
 Role: {role}
@@ -479,9 +486,9 @@ deepseek-worker, opencode, codex exec, spawn_agent, followup_task, or any other 
 Use only ordinary task-scoped file and shell tools allowed by the task.
 
 Your final response must be exactly one JSON object with no Markdown fence or surrounding prose:
-{{"status":"success","summary":"concise result","files_changed":[],"tests":[],"risks":[]}}
+{{"status":"success","summary":"concise result","files_changed":{result_example},"tests":[],"risks":[]}}
 The only allowed status values are success, partial, blocked, or error. Keep summary concise. List
-only files actually changed. The files_changed, tests, and risks fields must each be JSON arrays of
+only files actually changed. {change_instruction} The files_changed, tests, and risks fields must each be JSON arrays of
 strings. Use [] when a list is empty; never use 0, null, or the string "none" for these fields. Put
 test command outcomes in tests and unresolved concerns in risks.
 
@@ -1132,8 +1139,6 @@ def invoke_codex(
     timeout: int,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    # A launched job owns one process group, so cancellation/timeout reaches OpenCode too.
-    # Direct runs and isolated native canaries keep their independent process groups.
     launched_job = bool(env and env.get("DEEPSEEK_WORKER_LAUNCHED") == "1")
     process = subprocess.Popen(
         command,
@@ -1142,21 +1147,35 @@ def invoke_codex(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
-        start_new_session=not launched_job,
+        start_new_session=True,
         env=env,
     )
+    job_id = env.get("DEEPSEEK_WORKER_JOB_ID") if launched_job and env else None
+    if job_id:
+        try:
+            update_job_metadata(job_id, active_provider_pid=process.pid)
+            append_job_event(job_id, "provider_started", "running")
+        except WorkerError:
+            pass
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        process_group = os.getpgrp() if launched_job else process.pid
-        os.killpg(process_group, signal.SIGTERM)
+        os.killpg(process.pid, signal.SIGTERM)
         try:
             stdout, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            os.killpg(process_group, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGKILL)
             stdout, stderr = process.communicate()
-        return subprocess.CompletedProcess(command, 124, stdout, stderr + f"\nworker timed out after {timeout} seconds")
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        result = subprocess.CompletedProcess(command, 124, stdout, stderr + f"\nworker timed out after {timeout} seconds")
+    else:
+        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    if job_id:
+        try:
+            update_job_metadata(job_id, active_provider_pid=None)
+            append_job_event(job_id, "provider_finished", "running")
+        except WorkerError:
+            pass
+    return result
 
 
 def record_run(payload: dict[str, Any], run_type: str = "external_run") -> None:
@@ -1412,7 +1431,7 @@ def _launch_worker(args: argparse.Namespace) -> dict[str, Any]:
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
-            env={**os.environ, "DEEPSEEK_WORKER_LAUNCHED": "1"},
+            env={**os.environ, "DEEPSEEK_WORKER_LAUNCHED": "1", "DEEPSEEK_WORKER_JOB_ID": job_id},
         )
     update_job_metadata(job_id, state="running", pid=process.pid, started_at=datetime.now(UTC).isoformat())
     append_job_event(job_id, "started", "running")
@@ -1479,6 +1498,14 @@ def terminate_process_group(pid: int) -> bool:
     return True
 
 
+def terminate_job_processes(metadata: dict[str, Any]) -> bool:
+    pids = [int(metadata.get("pid", 0)), int(metadata.get("active_provider_pid", 0) or 0)]
+    terminated = False
+    for pid in dict.fromkeys(pid for pid in pids if pid > 0):
+        terminated = terminate_process_group(pid) or terminated
+    return terminated
+
+
 def terminal_job_payload(metadata: dict[str, Any], status: str, summary: str, risk: str) -> dict[str, Any]:
     job_id = str(metadata["job_id"])
     try:
@@ -1510,7 +1537,7 @@ def poll_worker(job_id: str) -> dict[str, Any]:
     _metadata_path, stdout_path, stderr_path = job_paths(job_id)
     pid = int(metadata.get("pid", 0))
     if job_deadline_expired(metadata):
-        terminated = terminate_process_group(pid)
+        terminated = terminate_job_processes(metadata)
         append_job_event(job_id, "deadline_expired", str(metadata.get("state", "running")), process_terminated=terminated, signal="TERM/KILL")
         payload = terminal_job_payload(metadata, "error", "DeepSeek worker exceeded its bounded job deadline.", "job timed out; no automatic replay was performed")
         write_job_result(job_id, payload, terminal_state_for_payload(payload, "timed_out"))
@@ -1542,7 +1569,7 @@ def cancel_worker(job_id: str) -> dict[str, Any]:
     if metadata.get("state") in TERMINAL_JOB_STATES:
         return job_result_response(job_id, metadata)
     pid = int(metadata.get("pid", 0))
-    terminated = terminate_process_group(pid)
+    terminated = terminate_job_processes(metadata)
     append_job_event(job_id, "cancel_requested", str(metadata.get("state", "running")), process_terminated=terminated, signal="TERM/KILL")
     changed_files = terminal_job_payload(metadata, "blocked", "", "")["files_changed"]
     payload = terminal_job_payload(
