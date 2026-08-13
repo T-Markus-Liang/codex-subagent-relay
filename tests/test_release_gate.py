@@ -192,7 +192,7 @@ class ReleaseGateTests(unittest.TestCase):
                 with launched_lock:
                     launched.append(result)
 
-            with patch.object(module, "JOB_ROOT", Path(jobs)), patch.object(module.time, "time", return_value=1_700_000_000), patch.object(module.secrets, "token_hex", side_effect=token_counter), patch.object(module.subprocess, "Popen", side_effect=lambda *a, **k: DummyProcess(next(counter))):
+            with patch.object(module, "JOB_ROOT", Path(jobs)), patch.object(module, "workspace_snapshot", return_value={}), patch.object(module.time, "time", return_value=1_700_000_000), patch.object(module.secrets, "token_hex", side_effect=token_counter), patch.object(module.subprocess, "Popen", side_effect=lambda *a, **k: DummyProcess(next(counter))):
                 threads = [threading.Thread(target=launch) for _ in range(24)]
                 for thread in threads:
                     thread.start()

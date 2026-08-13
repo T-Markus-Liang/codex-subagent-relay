@@ -25,9 +25,10 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
+RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
 SCHEMA_PATH = ROOT / "schemas/result.schema.json"
 CODEX_HOME = Path.home() / ".codex"
 CONFIG_PATH = CODEX_HOME / "config.toml"
@@ -50,38 +51,76 @@ CLIPROXY_CANARY_LOG_PATH = Path(
         str(Path.home() / ".local/state/cliproxyapi-native-canary/auth/logs/main.log"),
     )
 )
-DEFAULT_READ_TIMEOUT = 75
-DEFAULT_WRITE_TIMEOUT = 120
-DEFAULT_GENERAL_TIMEOUT = 120
-
-PROVIDERS = {
-    "sensenova": {"profile": "ds-sensenova", "port": 15741, "model": "sensenova/deepseek-v4-flash"},
-    "sensenova1": {"profile": "ds-sensenova1", "port": 15742, "model": "sensenova1/deepseek-v4-flash"},
-    "opencode-go": {"profile": "ds-opencode-go", "port": 15743, "model": "opencode-go/deepseek-v4-flash"},
-}
-
-READ_ONLY_ROLES = {
-    "search",
-    "repository-exploration",
-    "exploration",
-    "logs",
-    "log-analysis",
-}
-WORKER_ROLES = {
-    "implementation",
-    "test",
-    "testing",
-    "debug",
-    "refactor",
-    "documentation",
-    "docs",
-}
-SOL_ROLES = {"architecture", "planning", "complex-decision", "decision", "final-review"}
-TERRA_ROLES = {"review", "validation", "second-opinion"}
-
+JOB_SCHEMA_VERSION = 1
+JOB_STATES = {"queued", "running", "succeeded", "partial", "blocked", "failed", "cancelled", "timed_out"}
+TERMINAL_JOB_STATES = {"succeeded", "partial", "blocked", "failed", "cancelled", "timed_out"}
+JOB_TIMEOUT_GRACE_SECONDS = 15
 
 class WorkerError(RuntimeError):
     pass
+
+
+def load_runtime_config(path: Path = RUNTIME_CONFIG_PATH) -> dict[str, Any]:
+    """Load declarative routing without accepting credentials or arbitrary adapters."""
+    try:
+        with path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkerError(f"invalid relay configuration: {type(exc).__name__}") from exc
+    if not isinstance(config, dict) or config.get("schema_version") != 1:
+        raise WorkerError("unsupported relay configuration schema")
+    providers = config.get("providers")
+    roles = config.get("roles")
+    timeouts = config.get("timeouts")
+    fallback = config.get("fallback")
+    if not all(isinstance(value, dict) for value in (providers, roles, timeouts, fallback)):
+        raise WorkerError("relay configuration has missing sections")
+    normalized_providers: dict[str, dict[str, Any]] = {}
+    for name, metadata in providers.items():
+        if not isinstance(name, str) or not isinstance(metadata, dict):
+            raise WorkerError("relay configuration has invalid provider")
+        if metadata.get("adapter") != "opencode" or not isinstance(metadata.get("profile"), str) or not isinstance(metadata.get("model"), str):
+            raise WorkerError("relay configuration has invalid provider adapter")
+        try:
+            port = int(metadata.get("port"))
+        except (TypeError, ValueError) as exc:
+            raise WorkerError("relay configuration has invalid provider port") from exc
+        if not 1 <= port <= 65535:
+            raise WorkerError("relay configuration has invalid provider port")
+        normalized_providers[name] = {**metadata, "port": port}
+    normalized_roles: dict[str, set[str]] = {}
+    for name in ("read_only", "worker", "sol", "terra"):
+        values = roles.get(name)
+        if not isinstance(values, list) or not values or not all(isinstance(value, str) and value for value in values):
+            raise WorkerError("relay configuration has invalid role policy")
+        normalized_roles[name] = set(values)
+    normalized_fallback: dict[str, tuple[str, ...]] = {}
+    for name in ("read_only", "worker", "general"):
+        values = fallback.get(name)
+        if not isinstance(values, list) or not values or any(value not in normalized_providers for value in values):
+            raise WorkerError("relay configuration has invalid fallback policy")
+        normalized_fallback[name] = tuple(values)
+    normalized_timeouts: dict[str, int] = {}
+    for name in ("read_only_seconds", "write_seconds", "general_seconds"):
+        try:
+            value = int(timeouts.get(name))
+        except (TypeError, ValueError) as exc:
+            raise WorkerError("relay configuration has invalid timeout") from exc
+        if value < 30:
+            raise WorkerError("relay configuration timeout must be at least 30 seconds")
+        normalized_timeouts[name] = value
+    return {"providers": normalized_providers, "roles": normalized_roles, "fallback": normalized_fallback, "timeouts": normalized_timeouts}
+
+
+RUNTIME_CONFIG = load_runtime_config()
+PROVIDERS = RUNTIME_CONFIG["providers"]
+READ_ONLY_ROLES = RUNTIME_CONFIG["roles"]["read_only"]
+WORKER_ROLES = RUNTIME_CONFIG["roles"]["worker"]
+SOL_ROLES = RUNTIME_CONFIG["roles"]["sol"]
+TERRA_ROLES = RUNTIME_CONFIG["roles"]["terra"]
+DEFAULT_READ_TIMEOUT = RUNTIME_CONFIG["timeouts"]["read_only_seconds"]
+DEFAULT_WRITE_TIMEOUT = RUNTIME_CONFIG["timeouts"]["write_seconds"]
+DEFAULT_GENERAL_TIMEOUT = RUNTIME_CONFIG["timeouts"]["general_seconds"]
 
 
 CIRCUIT_FAILURE_THRESHOLD = 2
@@ -389,11 +428,11 @@ def build_provider_order(role: str, selected_provider: str, automatic: bool) -> 
         return [selected_provider]
     normalized = normalize_role(role)
     if normalized in READ_ONLY_ROLES:
-        preferred = ("sensenova1", "sensenova")
+        preferred = RUNTIME_CONFIG["fallback"]["read_only"]
     elif normalized in WORKER_ROLES:
-        preferred = ("sensenova1", "sensenova")
+        preferred = RUNTIME_CONFIG["fallback"]["worker"]
     else:
-        preferred = ("sensenova1", "sensenova")
+        preferred = RUNTIME_CONFIG["fallback"]["general"]
     return [selected_provider, *(name for name in preferred if name != selected_provider)]
 
 
@@ -449,6 +488,30 @@ test command outcomes in tests and unresolved concerns in risks.
 Task:
 {task}
 """
+
+
+def adapter_command(provider: str, workdir: Path, role: str, sandbox: str, task: str) -> list[str]:
+    """Build a bounded adapter invocation from the reviewed declarative Provider policy."""
+    metadata = PROVIDERS.get(provider)
+    if metadata is None:
+        raise WorkerError(f"unknown provider: {provider}")
+    if metadata.get("adapter") != "opencode":
+        raise WorkerError(f"unsupported provider adapter: {metadata.get('adapter')}")
+    return [
+        str(OPENCODE_PATH),
+        "run",
+        "--dir",
+        str(workdir),
+        "--agent",
+        "plan" if sandbox == "read-only" else "build",
+        "--model",
+        str(metadata["model"]),
+        "--format",
+        "json",
+        "--title",
+        f"deepseek-worker:{role}",
+        worker_prompt(task, role),
+    ]
 
 
 STATUS_ALIASES = {
@@ -1069,6 +1132,9 @@ def invoke_codex(
     timeout: int,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    # A launched job owns one process group, so cancellation/timeout reaches OpenCode too.
+    # Direct runs and isolated native canaries keep their independent process groups.
+    launched_job = bool(env and env.get("DEEPSEEK_WORKER_LAUNCHED") == "1")
     process = subprocess.Popen(
         command,
         cwd=workdir,
@@ -1076,17 +1142,18 @@ def invoke_codex(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
-        start_new_session=True,
+        start_new_session=not launched_job,
         env=env,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
+        process_group = os.getpgrp() if launched_job else process.pid
+        os.killpg(process_group, signal.SIGTERM)
         try:
             stdout, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process_group, signal.SIGKILL)
             stdout, stderr = process.communicate()
         return subprocess.CompletedProcess(command, 124, stdout, stderr + f"\nworker timed out after {timeout} seconds")
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
@@ -1114,13 +1181,86 @@ def record_run(payload: dict[str, Any], run_type: str = "external_run") -> None:
 
 
 def job_paths(job_id: str) -> tuple[Path, Path, Path]:
+    """Compatibility paths for a job's durable metadata and transient process output."""
     if not job_id or any(char not in "0123456789abcdef-" for char in job_id):
         raise WorkerError("invalid worker job id")
     return (
-        JOB_ROOT / f"{job_id}.json",
-        JOB_ROOT / f"{job_id}.stdout",
-        JOB_ROOT / f"{job_id}.stderr",
+        JOB_ROOT / job_id / "meta.json",
+        JOB_ROOT / job_id / "stdout.jsonl",
+        JOB_ROOT / job_id / "stderr.log",
     )
+
+
+def job_artifact_path(job_id: str, name: str) -> Path:
+    metadata_path, _stdout_path, _stderr_path = job_paths(job_id)
+    return metadata_path.parent / name
+
+
+def job_state_for_payload(payload: dict[str, Any]) -> str:
+    status = str(payload.get("status", "error"))
+    return {
+        "success": "succeeded",
+        "partial": "partial",
+        "blocked": "blocked",
+        "error": "failed",
+    }.get(status, "failed")
+
+
+def read_job_metadata(job_id: str) -> dict[str, Any]:
+    metadata_path, _stdout_path, _stderr_path = job_paths(job_id)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkerError(f"worker job not found: {type(exc).__name__}") from exc
+    if not isinstance(metadata, dict) or metadata.get("job_id") != job_id:
+        raise WorkerError("invalid worker job metadata")
+    return metadata
+
+
+def update_job_metadata(job_id: str, **updates: Any) -> dict[str, Any]:
+    metadata_path, _stdout_path, _stderr_path = job_paths(job_id)
+    metadata = read_job_metadata(job_id)
+    metadata.update(updates)
+    write_json(metadata_path, metadata)
+    return metadata
+
+
+def idempotency_digest(key: str | None) -> str | None:
+    if key is None:
+        return None
+    if not key.strip() or len(key.encode("utf-8")) > 256:
+        raise WorkerError("idempotency key must contain 1-256 bytes")
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def find_idempotent_job(key_digest: str, workdir: Path) -> dict[str, Any] | None:
+    """Return a prior job for the same opaque key and workdir without persisting key text."""
+    try:
+        directories = list(JOB_ROOT.iterdir())
+    except OSError:
+        return None
+    for directory in directories:
+        metadata_path = directory / "meta.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("idempotency_key_sha256") == key_digest
+            and metadata.get("workdir") == str(workdir)
+        ):
+            return metadata
+    return None
+
+
+def idempotency_lock(key_digest: str):
+    """Serialize duplicate launch claims without retaining the caller's opaque key."""
+    lock_path = JOB_ROOT / "idempotency" / f"{key_digest}.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1133,12 +1273,90 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def append_job_event(job_id: str, event: str, state: str, **details: Any) -> None:
+    """Persist lifecycle facts only; prompts, raw events, and request payloads never enter this log."""
+    if state not in JOB_STATES:
+        raise WorkerError("invalid job event state")
+    safe_details = {
+        key: value for key, value in details.items()
+        if key in {"reason", "process_terminated", "signal"} and isinstance(value, (str, bool))
+    }
+    record = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "event": event,
+        "state": state,
+        **safe_details,
+    }
+    path = job_artifact_path(job_id, "events.jsonl")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def write_job_result(job_id: str, payload: dict[str, Any], state: str, diagnostic: str | None = None) -> dict[str, Any]:
+    if state not in TERMINAL_JOB_STATES:
+        raise WorkerError("invalid terminal job state")
+    metadata = read_job_metadata(job_id)
+    if metadata.get("state") in TERMINAL_JOB_STATES:
+        return metadata
+    _metadata_path, stdout_path, stderr_path = job_paths(job_id)
+    after = workspace_snapshot(Path(str(metadata["workdir"])))
+    write_json(job_artifact_path(job_id, "after.json"), after)
+    write_json(job_artifact_path(job_id, "result.json"), payload)
+    if diagnostic:
+        write_json(job_artifact_path(job_id, "diagnostic.json"), {"message": redact(diagnostic, 1000)})
+    update_job_metadata(
+        job_id,
+        state=state,
+        finished_at=datetime.now(UTC).isoformat(),
+        result_status=payload.get("status"),
+        result_path="result.json",
+        after_manifest_path="after.json",
+        diagnostic_path="diagnostic.json" if diagnostic else None,
+    )
+    append_job_event(job_id, "terminal", state, reason=str(payload.get("status", "error")))
+    # The result is durable; discard raw streamed model output after terminalization.
+    for path in (stdout_path, stderr_path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return read_job_metadata(job_id)
+
+
 def launch_worker(args: argparse.Namespace) -> dict[str, Any]:
+    key_digest = idempotency_digest(getattr(args, "idempotency_key", None))
+    if key_digest is None:
+        return _launch_worker(args)
+    handle = idempotency_lock(key_digest)
+    try:
+        return _launch_worker(args)
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _launch_worker(args: argparse.Namespace) -> dict[str, Any]:
     """Start a run in a separate process group and return immediately for Desktop polling."""
-    load_task(args.task, args.task_file)
+    task = load_task(args.task, args.task_file)
     workdir = Path(args.workdir).expanduser().resolve()
     if not workdir.is_dir():
         raise WorkerError(f"workdir not found: {workdir}")
+    key_digest = idempotency_digest(getattr(args, "idempotency_key", None))
+    if key_digest:
+        existing = find_idempotent_job(key_digest, workdir)
+        if existing:
+            return {
+                "status": "running" if existing.get("state") not in TERMINAL_JOB_STATES else str(existing.get("result_status", "error")),
+                "job_id": existing["job_id"],
+                "role": existing.get("role"),
+                "provider": existing.get("provider"),
+                "job_state": existing.get("state"),
+                "idempotent_reuse": True,
+            }
     job_id = f"{int(time.time())}-{secrets.token_hex(6)}"
     metadata_path, stdout_path, stderr_path = job_paths(job_id)
     command = [
@@ -1164,6 +1382,25 @@ def launch_worker(args: argparse.Namespace) -> dict[str, Any]:
     if args.no_record:
         command.append("--no-record")
     JOB_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_json(job_artifact_path(job_id, "before.json"), workspace_snapshot(workdir))
+    write_json(
+        metadata_path,
+        {
+            "schema_version": JOB_SCHEMA_VERSION,
+            "job_id": job_id,
+            "state": "queued",
+            "created_at": datetime.now(UTC).isoformat(),
+            "role": args.role,
+            "provider": args.provider,
+            "sandbox": args.sandbox,
+            "timeout_seconds": args.timeout,
+            "workdir": str(workdir),
+            "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
+            "idempotency_key_sha256": key_digest,
+            "before_manifest_path": "before.json",
+        },
+    )
+    append_job_event(job_id, "created", "queued")
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
         os.chmod(stdout_path, 0o600)
         os.chmod(stderr_path, 0o600)
@@ -1175,22 +1412,16 @@ def launch_worker(args: argparse.Namespace) -> dict[str, Any]:
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
+            env={**os.environ, "DEEPSEEK_WORKER_LAUNCHED": "1"},
         )
-    write_json(
-        metadata_path,
-        {
-            "job_id": job_id,
-            "pid": process.pid,
-            "started_at": datetime.now(UTC).isoformat(),
-            "role": args.role,
-            "provider": args.provider,
-            "workdir": str(workdir),
-        },
-    )
-    return {"status": "running", "job_id": job_id, "role": args.role, "provider": args.provider}
+    update_job_metadata(job_id, state="running", pid=process.pid, started_at=datetime.now(UTC).isoformat())
+    append_job_event(job_id, "started", "running")
+    return {"status": "running", "job_id": job_id, "role": args.role, "provider": args.provider, "job_state": "running"}
 
 
 def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1200,34 +1431,176 @@ def process_is_running(pid: int) -> bool:
     return True
 
 
-def poll_worker(job_id: str) -> dict[str, Any]:
-    metadata_path, stdout_path, stderr_path = job_paths(job_id)
+def job_result_response(job_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkerError(f"worker job not found: {type(exc).__name__}") from exc
+        result = json.loads(job_artifact_path(job_id, "result.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        result = None
+    if isinstance(result, dict):
+        return {**result, "job_id": job_id, "job_state": metadata.get("state")}
+    return {
+        "status": "error",
+        "job_id": job_id,
+        "job_state": metadata.get("state"),
+        "summary": "Worker terminal state is missing its structured result artifact.",
+        "files_changed": [],
+        "tests": [],
+        "risks": ["job artifact integrity failure"],
+    }
+
+
+def job_deadline_expired(metadata: dict[str, Any]) -> bool:
+    timeout_seconds = int(metadata.get("timeout_seconds") or 0)
+    if timeout_seconds <= 0:
+        role = str(metadata.get("role", "general-execution"))
+        timeout_seconds = effective_timeout(0, role)
+    try:
+        started_at = datetime.fromisoformat(str(metadata["started_at"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return datetime.now(UTC) > started_at + timedelta(seconds=timeout_seconds + JOB_TIMEOUT_GRACE_SECONDS)
+
+
+def terminate_process_group(pid: int) -> bool:
+    if not process_is_running(pid):
+        return False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    deadline = time.monotonic() + 2.0
+    while process_is_running(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if process_is_running(pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+    return True
+
+
+def terminal_job_payload(metadata: dict[str, Any], status: str, summary: str, risk: str) -> dict[str, Any]:
+    job_id = str(metadata["job_id"])
+    try:
+        before = json.loads(job_artifact_path(job_id, "before.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        before = {}
+    return {
+        "status": status,
+        "provider": metadata.get("provider"),
+        "role": metadata.get("role"),
+        "summary": summary,
+        "files_changed": changed_workspace_paths(before, workspace_snapshot(Path(str(metadata["workdir"]))),),
+        "tests": [],
+        "risks": [risk],
+    }
+
+
+def terminal_state_for_payload(payload: dict[str, Any], default_state: str) -> str:
+    """Any unaccepted terminal outcome with side effects is an explicit review handoff."""
+    if default_state in {"failed", "cancelled", "timed_out"} and payload.get("files_changed"):
+        return "partial"
+    return default_state
+
+
+def poll_worker(job_id: str) -> dict[str, Any]:
+    metadata = read_job_metadata(job_id)
+    if metadata.get("state") in TERMINAL_JOB_STATES:
+        return job_result_response(job_id, metadata)
+    _metadata_path, stdout_path, stderr_path = job_paths(job_id)
+    pid = int(metadata.get("pid", 0))
+    if job_deadline_expired(metadata):
+        terminated = terminate_process_group(pid)
+        append_job_event(job_id, "deadline_expired", str(metadata.get("state", "running")), process_terminated=terminated, signal="TERM/KILL")
+        payload = terminal_job_payload(metadata, "error", "DeepSeek worker exceeded its bounded job deadline.", "job timed out; no automatic replay was performed")
+        write_job_result(job_id, payload, terminal_state_for_payload(payload, "timed_out"))
+        return job_result_response(job_id, read_job_metadata(job_id))
     try:
         raw = stdout_path.read_text(encoding="utf-8").strip()
         result = json.loads(raw) if raw else None
     except (OSError, json.JSONDecodeError):
         result = None
     if isinstance(result, dict):
-        return {**result, "job_id": job_id, "job_state": "completed"}
-    if process_is_running(int(metadata.get("pid", 0))):
+        state = job_state_for_payload(result)
+        write_job_result(job_id, result, state)
+        return job_result_response(job_id, read_job_metadata(job_id))
+    if process_is_running(pid):
+        if metadata.get("state") != "running":
+            update_job_metadata(job_id, state="running")
         return {"status": "running", "job_id": job_id, "job_state": "running"}
     try:
         error = redact(stderr_path.read_text(encoding="utf-8"), 300)
     except OSError:
         error = "worker exited without result"
-    return {
-        "status": "error",
-        "job_id": job_id,
-        "job_state": "completed",
-        "summary": "DeepSeek worker exited without a structured result.",
-        "files_changed": [],
-        "tests": [],
-        "risks": [error or "worker exited without result"],
-    }
+    payload = terminal_job_payload(metadata, "error", "DeepSeek worker exited without a structured result.", error or "stale worker PID exited without result")
+    write_job_result(job_id, payload, terminal_state_for_payload(payload, "failed"), error)
+    return job_result_response(job_id, read_job_metadata(job_id))
+
+
+def cancel_worker(job_id: str) -> dict[str, Any]:
+    metadata = read_job_metadata(job_id)
+    if metadata.get("state") in TERMINAL_JOB_STATES:
+        return job_result_response(job_id, metadata)
+    pid = int(metadata.get("pid", 0))
+    terminated = terminate_process_group(pid)
+    append_job_event(job_id, "cancel_requested", str(metadata.get("state", "running")), process_terminated=terminated, signal="TERM/KILL")
+    changed_files = terminal_job_payload(metadata, "blocked", "", "")["files_changed"]
+    payload = terminal_job_payload(
+        metadata,
+        "blocked",
+        "DeepSeek worker was cancelled before a structured result was accepted.",
+        "cancellation requested; existing workspace changes require main-model review" if changed_files else "cancellation requested before workspace changes",
+    )
+    write_job_result(job_id, payload, terminal_state_for_payload(payload, "cancelled"))
+    return {**job_result_response(job_id, read_job_metadata(job_id)), "process_terminated": terminated}
+
+
+def job_public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Expose durable lifecycle facts without task text, raw output, or opaque key material."""
+    fields = (
+        "job_id", "schema_version", "state", "created_at", "started_at", "finished_at",
+        "role", "provider", "sandbox", "timeout_seconds", "result_status",
+        "before_manifest_path", "after_manifest_path", "result_path", "diagnostic_path",
+    )
+    return {field: metadata[field] for field in fields if field in metadata}
+
+
+def list_jobs(limit: int = 20) -> dict[str, Any]:
+    if not 1 <= limit <= 100:
+        raise WorkerError("job list limit must be between 1 and 100")
+    jobs: list[dict[str, Any]] = []
+    try:
+        directories = list(JOB_ROOT.iterdir())
+    except OSError:
+        directories = []
+    for directory in directories:
+        try:
+            metadata = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(metadata, dict) and isinstance(metadata.get("job_id"), str):
+            jobs.append(job_public_metadata(metadata))
+    jobs.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+    return {"status": "success", "jobs": jobs[:limit]}
+
+
+def inspect_job(job_id: str) -> dict[str, Any]:
+    metadata = read_job_metadata(job_id)
+    payload: dict[str, Any] = {"status": "success", "job": job_public_metadata(metadata)}
+    for artifact in ("before.json", "after.json", "result.json", "diagnostic.json"):
+        try:
+            value = json.loads(job_artifact_path(job_id, artifact).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        payload[artifact.removesuffix(".json")] = value
+    try:
+        payload["events"] = [
+            item for line in job_artifact_path(job_id, "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if isinstance((item := json.loads(line)), dict)
+        ]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return payload
 
 
 def run_worker(args: argparse.Namespace) -> dict[str, Any]:
@@ -1328,21 +1701,7 @@ def _run_worker_locked(
     profile = PROVIDERS[provider]["profile"]
     for attempt_index, provider in enumerate(provider_order):
         profile = PROVIDERS[provider]["profile"]
-        command = [
-            str(OPENCODE_PATH),
-            "run",
-            "--dir",
-            str(workdir),
-            "--agent",
-            "plan" if sandbox == "read-only" else "build",
-            "--model",
-            str(PROVIDERS[provider]["model"]),
-            "--format",
-            "json",
-            "--title",
-            f"deepseek-worker:{decision['role']}",
-            worker_prompt(task, decision["role"]),
-        ]
+        command = adapter_command(provider, workdir, decision["role"], sandbox, task)
         provider_deadline = time.monotonic() + attempt_timeouts[attempt_index]
         stream_retry_count = 0
         while True:
@@ -1662,7 +2021,8 @@ def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_ov
     if agent_type is None:
         raise WorkerError(f"unsupported native canary provider: {provider}")
     try:
-        config = tomllib.load(CONFIG_PATH.open("rb"))
+        with CONFIG_PATH.open("rb") as handle:
+            config = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise WorkerError(f"cannot read Codex config: {type(exc).__name__}") from exc
     root_provider = str(config.get("model_provider", ""))
@@ -2010,7 +2370,8 @@ def doctor() -> dict[str, Any]:
         profile_path = CODEX_HOME / f"{metadata['profile']}.config.toml"
         valid = False
         try:
-            profile = tomllib.load(profile_path.open("rb"))
+            with profile_path.open("rb") as handle:
+                profile = tomllib.load(handle)
             valid = profile.get("model_provider") == provider and profile.get("model") == "deepseek-v4-flash"
         except (OSError, tomllib.TOMLDecodeError):
             pass
@@ -2169,6 +2530,10 @@ def parser() -> argparse.ArgumentParser:
             default=0,
             help="Seconds for the whole Worker run; 0 selects 75s read-only or 120s write/general defaults.",
         )
+        command_parser.add_argument(
+            "--idempotency-key",
+            help="Opaque caller key (not retained in plaintext); reuses a matching job in the same workdir.",
+        )
         command_parser.add_argument("--no-record", action="store_true")
 
     run_parser = commands.add_parser("run", help="Run one bounded execution task through a DeepSeek profile.")
@@ -2179,6 +2544,18 @@ def parser() -> argparse.ArgumentParser:
 
     poll_parser = commands.add_parser("poll", help="Read a launched Worker task result without blocking.")
     poll_parser.add_argument("--job-id", required=True)
+
+    status_parser = commands.add_parser("status", help="Read durable job metadata and terminal result without model access.")
+    status_parser.add_argument("--job-id", required=True)
+
+    cancel_parser = commands.add_parser("cancel", help="Cancel a running Worker job without replaying it.")
+    cancel_parser.add_argument("--job-id", required=True)
+
+    list_parser = commands.add_parser("list", help="List recent durable jobs without task text or raw output.")
+    list_parser.add_argument("--limit", type=int, default=20)
+
+    inspect_parser = commands.add_parser("inspect", help="Inspect one durable job's metadata, manifests, and bounded result.")
+    inspect_parser.add_argument("--job-id", required=True)
 
     smoke_parser = commands.add_parser("smoke-test", help="Run a tiny read-only live task through one provider.")
     smoke_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
@@ -2226,6 +2603,14 @@ def main() -> int:
             payload = launch_worker(args)
         elif args.command == "poll":
             payload = poll_worker(args.job_id)
+        elif args.command == "status":
+            payload = poll_worker(args.job_id)
+        elif args.command == "cancel":
+            payload = cancel_worker(args.job_id)
+        elif args.command == "list":
+            payload = list_jobs(args.limit)
+        elif args.command == "inspect":
+            payload = inspect_job(args.job_id)
         elif args.command == "smoke-test":
             run_args = argparse.Namespace(
                 task="Inspect the current directory without modifying files. Reply with a short success summary.",

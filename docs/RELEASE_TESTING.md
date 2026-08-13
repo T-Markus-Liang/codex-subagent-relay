@@ -19,6 +19,8 @@ It must pass completely. It verifies:
 - Bounded two-provider fallback under repeated bad primary responses.
 - Per-workdir write lock contention: one owner and all competing writers blocked.
 - Concurrent `launch -> poll` job identity and output-file isolation.
+- Durable job lifecycle: atomic metadata/results/manifests, idempotent launch reuse, cancellation,
+  stale-PID recovery, and timeout/partial-write terminalization without automatic replay.
 - Run metadata excludes task text and secret-like result content.
 - Real workspace changes stop automatic retry and Provider fallback.
 - Native canaries remain evidence-only and must never promote a production route automatically.
@@ -38,7 +40,8 @@ The release gate is a deterministic stress test of relay behavior, not a claim a
 | Stream faults | malformed, guessed, no-tool, error, missing-finish, and length-truncated streams | no invalid result accepted |
 | Fallback | 32 repeated invalid-primary / valid-secondary sequences | bounded retry and only valid secondary acceptance |
 | Write contention | 12 simultaneous lock contenders for one workdir | exactly one owner, 11 blocked |
-| Job isolation | 24 concurrent `launch` operations | unique job IDs and metadata/stdout/stderr paths |
+| Job isolation | 24 concurrent `launch` operations | unique job IDs and private metadata/stdout/stderr paths |
+| Lifecycle | success, stale PID, cancellation, timeout with side effects, idempotent repeat | durable terminal state; changed work is always `partial` |
 | Data protection | synthetic task and secret-like risk content | neither persisted in run metadata |
 | Side effects | invalid result after workspace change | no retry or Provider fallback |
 | Install portability | temporary-home install with selected Python | installed launcher invokes that Python |
@@ -61,16 +64,16 @@ Before a candidate release:
 5. Keep native V1 and V2 canaries in a separate report. Their pass rate does not count toward the
    external Worker production SLO.
 
-The included runner is sequential by design and creates one disposable directory per job:
+The included runner is sequential by design, defaults to the real automatic route, creates one disposable directory per job, verifies that read-only work leaves it empty, and verifies the exact single-file byte result. Run the Phase 0 qualification in batches so an upstream outage is visible before consuming the full budget:
 
 ```bash
-python3 scripts/live_soak.py --confirm-live --provider sensenova --role repository-exploration \
-  --runs 100 --report reports/sensenova-read.json
-python3 scripts/live_soak.py --confirm-live --provider sensenova1 --role documentation \
-  --runs 100 --report reports/sensenova1-write.json
+python3 scripts/live_soak.py --confirm-live --provider auto --role repository-exploration \
+  --runs 30 --report reports/phase0-auto-read-30.json
+python3 scripts/live_soak.py --confirm-live --provider auto --role documentation \
+  --runs 30 --report reports/phase0-auto-write-30.json
 ```
 
-Its report contains aggregates only. A nonzero exit means at least one run did not complete.
+For publication qualification, repeat with `--runs 100` for each production role and separately use explicit Provider runs only as diagnostic controls. The report contains aggregate metrics plus bounded per-run status, selected Provider, terminal safety fields, and no prompt, workspace path, request, response, or credential data. A nonzero exit means at least one run did not complete or violated workspace verification.
 
 For a concurrency experiment, keep write tasks pointed at one workdir and verify all but one return `blocked`; use separate disposable workdirs for read-only parallelism. Record the exact concurrency level, start method, status counts, p50/p95 duration, stream failure reasons, fallback count, and partial-write count. Do not publish a concurrency guarantee beyond the highest fully observed level.
 

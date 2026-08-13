@@ -18,6 +18,29 @@ loader.exec_module(module)
 
 
 class RouterTests(unittest.TestCase):
+    def test_declarative_runtime_config_matches_current_production_policy(self):
+        config = module.load_runtime_config(module.ROOT / "relay.toml")
+        self.assertEqual(config["fallback"]["read_only"], ("sensenova1", "sensenova"))
+        self.assertEqual(config["fallback"]["worker"], ("sensenova1", "sensenova"))
+        self.assertEqual(config["providers"]["sensenova1"]["adapter"], "opencode")
+        self.assertEqual(config["timeouts"]["read_only_seconds"], 75)
+
+    def test_declarative_runtime_config_rejects_unknown_adapter(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            path = Path(temporary_dir) / "relay.toml"
+            source = (module.ROOT / "relay.toml").read_text(encoding="utf-8")
+            path.write_text(source.replace('adapter = "opencode"', 'adapter = "shell"', 1), encoding="utf-8")
+            with self.assertRaises(module.WorkerError):
+                module.load_runtime_config(path)
+
+    def test_opencode_adapter_command_is_scoped_to_role_and_workdir(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            command = module.adapter_command("sensenova1", Path(temporary_dir), "repository-exploration", "read-only", "inspect only")
+        self.assertEqual(command[0], str(module.OPENCODE_PATH))
+        self.assertEqual(command[command.index("--dir") + 1], temporary_dir)
+        self.assertEqual(command[command.index("--agent") + 1], "plan")
+        self.assertEqual(command[command.index("--model") + 1], "sensenova1/deepseek-v4-flash")
+
     def test_invoke_codex_closes_stdin(self):
         class DummyProcess:
             pid = 123
@@ -30,6 +53,38 @@ class RouterTests(unittest.TestCase):
         with patch.object(module.subprocess, "Popen", return_value=DummyProcess()) as popen:
             module.invoke_codex(["codex", "exec", "test"], Path.cwd(), 5)
         self.assertIs(popen.call_args.kwargs["stdin"], module.subprocess.DEVNULL)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_launched_job_child_inherits_the_job_process_group(self):
+        class DummyProcess:
+            pid = 123
+            returncode = 0
+
+            def communicate(self, timeout):
+                return "", ""
+
+        with patch.object(module.subprocess, "Popen", return_value=DummyProcess()) as popen:
+            module.invoke_codex(["opencode", "run"], Path.cwd(), 5, env={"DEEPSEEK_WORKER_LAUNCHED": "1"})
+        self.assertFalse(popen.call_args.kwargs["start_new_session"])
+
+    def test_launched_job_timeout_signals_the_inherited_group_leader(self):
+        class DummyProcess:
+            pid = 123
+            returncode = 0
+            calls = 0
+
+            def communicate(self, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise module.subprocess.TimeoutExpired(["opencode"], timeout)
+                return "", ""
+
+        with patch.object(module.subprocess, "Popen", return_value=DummyProcess()), \
+             patch.object(module.os, "getpgrp", return_value=456), \
+             patch.object(module.os, "killpg") as killpg:
+            result = module.invoke_codex(["opencode", "run"], Path.cwd(), 5, env={"DEEPSEEK_WORKER_LAUNCHED": "1"})
+        self.assertEqual(result.returncode, 124)
+        killpg.assert_called_once_with(456, module.signal.SIGTERM)
 
     def test_launch_and_poll_use_nonblocking_job_files(self):
         class DummyProcess:
@@ -46,7 +101,7 @@ class RouterTests(unittest.TestCase):
                 timeout=90,
                 no_record=True,
             )
-            with patch.object(module, "JOB_ROOT", Path(jobs)), patch.object(module.secrets, "token_hex", return_value="abcdef123456"), patch.object(module.subprocess, "Popen", return_value=DummyProcess()) as popen:
+            with patch.object(module, "JOB_ROOT", Path(jobs)), patch.object(module, "workspace_snapshot", return_value={}), patch.object(module.secrets, "token_hex", return_value="abcdef123456"), patch.object(module.subprocess, "Popen", return_value=DummyProcess()) as popen:
                 launched = module.launch_worker(args)
                 self.assertEqual(launched["status"], "running")
                 self.assertEqual(popen.call_args.kwargs["stdin"], module.subprocess.DEVNULL)
@@ -56,7 +111,116 @@ class RouterTests(unittest.TestCase):
                 stdout.write_text('{"status":"success","summary":"done","files_changed":[],"tests":[],"risks":[]}\n')
                 completed = module.poll_worker(job_id)
                 self.assertEqual(completed["status"], "success")
-                self.assertEqual(completed["job_state"], "completed")
+                self.assertEqual(completed["job_state"], "succeeded")
+                self.assertTrue((metadata.parent / "before.json").is_file())
+                self.assertTrue((metadata.parent / "after.json").is_file())
+                self.assertTrue((metadata.parent / "result.json").is_file())
+                events = (metadata.parent / "events.jsonl").read_text(encoding="utf-8")
+                self.assertIn('"event":"created"', events)
+                self.assertIn('"event":"terminal"', events)
+                self.assertFalse(stdout.exists())
+
+    def test_launch_reuses_opaque_idempotency_key_in_same_workdir(self):
+        class DummyProcess:
+            pid = 4242
+
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as jobs:
+            args = SimpleNamespace(
+                task="inspect only", task_file=None, role="repository-exploration", workdir=workdir,
+                provider="auto", sandbox="read-only", timeout=90, no_record=True, idempotency_key="caller-key-1",
+            )
+            with patch.object(module, "JOB_ROOT", Path(jobs)), patch.object(module, "workspace_snapshot", return_value={}), patch.object(module.secrets, "token_hex", return_value="abcdef123456"), patch.object(module.subprocess, "Popen", return_value=DummyProcess()) as popen:
+                first = module.launch_worker(args)
+                second = module.launch_worker(args)
+                self.assertEqual(first["job_id"], second["job_id"])
+                self.assertTrue(second["idempotent_reuse"])
+                self.assertEqual(popen.call_count, 1)
+                metadata = module.read_job_metadata(first["job_id"])
+                self.assertNotIn("caller-key-1", json.dumps(metadata))
+                self.assertEqual(metadata["state"], "running")
+
+    def test_poll_recovers_stale_pid_as_failed_with_workspace_manifest(self):
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as jobs:
+            job_id = "1700000000-abcdef123456"
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                metadata, _stdout, stderr = module.job_paths(job_id)
+                module.write_json(module.job_artifact_path(job_id, "before.json"), {})
+                module.write_json(metadata, {
+                    "schema_version": 1, "job_id": job_id, "state": "running", "pid": 99999999,
+                    "started_at": module.datetime.now(module.UTC).isoformat(), "role": "implementation",
+                    "provider": "auto", "workdir": workdir, "timeout_seconds": 90,
+                })
+                stderr.parent.mkdir(parents=True, exist_ok=True)
+                stderr.write_text("stream vanished", encoding="utf-8")
+                with patch.object(module, "process_is_running", return_value=False):
+                    payload = module.poll_worker(job_id)
+                self.assertEqual(payload["status"], "error")
+                self.assertEqual(payload["job_state"], "failed")
+                self.assertTrue(module.job_artifact_path(job_id, "result.json").is_file())
+                self.assertTrue(module.job_artifact_path(job_id, "after.json").is_file())
+
+    def test_zero_pid_is_never_an_active_job(self):
+        self.assertFalse(module.process_is_running(0))
+
+    def test_list_and_inspect_hide_task_and_idempotency_material(self):
+        with tempfile.TemporaryDirectory() as jobs:
+            job_id = "1700000000-abcdef123456"
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                metadata, _stdout, _stderr = module.job_paths(job_id)
+                module.write_json(metadata, {
+                    "schema_version": 1, "job_id": job_id, "state": "succeeded", "created_at": "2026-08-13T00:00:00+00:00",
+                    "role": "implementation", "provider": "auto", "workdir": "/private/workdir", "task_sha256": "task-digest",
+                    "idempotency_key_sha256": "key-digest", "result_path": "result.json",
+                })
+                module.write_json(module.job_artifact_path(job_id, "result.json"), {"status": "success", "summary": "done", "files_changed": [], "tests": [], "risks": []})
+                listed = module.list_jobs()
+                inspected = module.inspect_job(job_id)
+            rendered = json.dumps({"listed": listed, "inspected": inspected})
+            self.assertNotIn("/private/workdir", rendered)
+            self.assertNotIn("task-digest", rendered)
+            self.assertNotIn("key-digest", rendered)
+            self.assertEqual(listed["jobs"][0]["job_id"], job_id)
+            self.assertEqual(inspected["result"]["status"], "success")
+            self.assertNotIn("events", inspected)
+
+    def test_cancel_marks_job_without_replaying_and_preserves_changes(self):
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as jobs:
+            job_id = "1700000000-abcdef123456"
+            changed = Path(workdir) / "changed.txt"
+            changed.write_text("existing change", encoding="utf-8")
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                metadata, _stdout, _stderr = module.job_paths(job_id)
+                module.write_json(module.job_artifact_path(job_id, "before.json"), {})
+                module.write_json(metadata, {
+                    "schema_version": 1, "job_id": job_id, "state": "running", "pid": 4242,
+                    "started_at": module.datetime.now(module.UTC).isoformat(), "role": "implementation",
+                    "provider": "auto", "workdir": workdir, "timeout_seconds": 90,
+                })
+                with patch.object(module, "terminate_process_group", return_value=True) as terminate:
+                    payload = module.cancel_worker(job_id)
+                self.assertEqual(payload["status"], "blocked")
+                self.assertEqual(payload["files_changed"], ["changed.txt"])
+                self.assertEqual(payload["job_state"], "partial")
+                terminate.assert_called_once_with(4242)
+
+    def test_timeout_with_workspace_change_is_partial_not_replayable_error(self):
+        with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as jobs:
+            job_id = "1700000000-abcdef123456"
+            changed = Path(workdir) / "changed.txt"
+            changed.write_text("existing change", encoding="utf-8")
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                metadata, _stdout, _stderr = module.job_paths(job_id)
+                module.write_json(module.job_artifact_path(job_id, "before.json"), {})
+                module.write_json(metadata, {
+                    "schema_version": 1, "job_id": job_id, "state": "running", "pid": 4242,
+                    "started_at": (module.datetime.now(module.UTC) - module.timedelta(seconds=200)).isoformat(),
+                    "role": "implementation", "provider": "auto", "workdir": workdir, "timeout_seconds": 1,
+                })
+                with patch.object(module, "terminate_process_group", return_value=True):
+                    payload = module.poll_worker(job_id)
+                self.assertEqual(payload["status"], "error")
+                self.assertEqual(payload["job_state"], "partial")
+                self.assertEqual(payload["files_changed"], ["changed.txt"])
 
     def test_native_canary_config_filters_unsupported_storage_field(self):
         with tempfile.TemporaryDirectory() as temporary_dir:

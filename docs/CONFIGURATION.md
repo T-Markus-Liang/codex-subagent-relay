@@ -2,6 +2,18 @@
 
 Codex Subagent Relay deliberately does not create Provider accounts, API keys, or proxy routes. Configure those outside this repository, then use `doctor` to prove the local contract is complete.
 
+## Declarative Relay Policy
+
+The tracked [`relay.toml`](../relay.toml) is the versioned, secret-free routing policy. It declares
+Provider aliases, OpenCode adapter model IDs, profile names, local health ports, role families,
+timeouts, and automatic fallback order. It does not accept URLs, API keys, bearer tokens, or task
+text. The runtime validates this file before it accepts commands.
+
+For a local policy experiment, set `DEEPSEEK_WORKER_CONFIG=/absolute/path/to/relay.toml` for the
+single command and run `doctor` first. Do not point a shared production installation at an
+unreviewed policy file. New adapter types require code and release-gate coverage; configuration
+cannot make the runtime execute an arbitrary command.
+
 ## Runtime Contract
 
 The current release has three named Provider slots. They are implementation names, not a portability layer for arbitrary model IDs. The current `doctor` command requires all three slots to be present and healthy before it returns `healthy`; configure all three even if normal automatic routing uses only the two SenseNova slots.

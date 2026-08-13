@@ -1,0 +1,35 @@
+schema_version = 1
+
+[timeouts]
+read_only_seconds = 75
+write_seconds = 120
+general_seconds = 120
+
+[providers.sensenova]
+adapter = "opencode"
+profile = "ds-sensenova"
+port = 15741
+model = "sensenova/deepseek-v4-flash"
+
+[providers.sensenova1]
+adapter = "opencode"
+profile = "ds-sensenova1"
+port = 15742
+model = "sensenova1/deepseek-v4-flash"
+
+[providers.opencode-go]
+adapter = "opencode"
+profile = "ds-opencode-go"
+port = 15743
+model = "opencode-go/deepseek-v4-flash"
+
+[roles]
+read_only = ["search", "repository-exploration", "exploration", "logs", "log-analysis"]
+worker = ["implementation", "test", "testing", "debug", "refactor", "documentation", "docs"]
+sol = ["architecture", "planning", "complex-decision", "decision", "final-review"]
+terra = ["review", "validation", "second-opinion"]
+
+[fallback]
+read_only = ["sensenova1", "sensenova"]
+worker = ["sensenova1", "sensenova"]
+general = ["sensenova1", "sensenova"]

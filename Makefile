@@ -3,7 +3,7 @@
 PYTHON ?= python3.11
 
 audit:
-	$(PYTHON) -m py_compile deepseek-worker tests/test_worker.py tests/test_release_gate.py tests/test_install.py
+	$(PYTHON) -m py_compile deepseek-worker scripts/live_soak.py tests/test_worker.py tests/test_release_gate.py tests/test_install.py tests/test_live_soak.py
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v

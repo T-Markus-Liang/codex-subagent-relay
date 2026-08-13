@@ -21,6 +21,21 @@ It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, Ope
 
 It does **not** provision Provider accounts, API keys, OpenCode, Codex profiles, local bridges, or a third-party Provider. This is a local relay around an already-working integration.
 
+## Job Lifecycle
+
+`launch` creates a private durable job directory under `~/.codex/deepseek-worker-jobs/<job-id>/`.
+It stores atomically-written `meta.json`, exact before/after workspace manifests, the bounded
+structured result, and only a redacted diagnostic when a process exits abnormally. Raw streamed
+output is deleted once a job reaches a terminal state. Task text and idempotency keys are never
+stored there in plaintext.
+
+States are `queued`, `running`, `succeeded`, `partial`, `blocked`, `failed`, `cancelled`, and
+`timed_out`. A timeout, cancellation, or stale process with workspace changes is recorded as
+`partial`, so it must be reviewed and is never automatically replayed. A no-side-effect failure is
+recorded as `failed` or `timed_out` and remains eligible for a caller-controlled new attempt.
+An asynchronous job owns its worker and OpenCode process group, so `cancel` and deadline recovery
+terminate the currently executing provider process before the terminal state is made durable.
+
 ## Requirements
 
 - macOS or Linux with Python 3.11+ and `make`. Windows is unsupported because the write lock uses POSIX `fcntl`.
@@ -77,6 +92,18 @@ deepseek-worker --json poll --job-id <job_id>
 
 `poll` can return `{"status":"running"}` while the Worker is active. Wait and poll the same job again. Do not start a second job for the same write task. Use `--task-file` for substantial briefs, and never include credentials or raw request data in it.
 
+To make a caller retry-safe, supply an opaque key. The Relay stores only its SHA-256 digest and will
+return the existing job for the same key and workdir, including across processes:
+
+```bash
+deepseek-worker --json launch --role implementation --workdir /absolute/path/to/repository \
+  --task-file /absolute/path/to/bounded-task.md --idempotency-key caller-generated-opaque-key
+deepseek-worker --json status --job-id <job_id>
+deepseek-worker --json cancel --job-id <job_id>
+deepseek-worker --json list --limit 20
+deepseek-worker --json inspect --job-id <job_id>
+```
+
 Every accepted terminal result has this exact core contract:
 
 ```json
@@ -117,6 +144,10 @@ deepseek-worker --json route --role implementation
 deepseek-worker --json run --task-file task.md --role implementation --workdir /path/to/repo
 deepseek-worker --json launch --task-file task.md --role implementation --workdir /path/to/repo
 deepseek-worker --json poll --job-id <job_id>
+deepseek-worker --json status --job-id <job_id>
+deepseek-worker --json cancel --job-id <job_id>
+deepseek-worker --json list --limit 20
+deepseek-worker --json inspect --job-id <job_id>
 deepseek-worker --json smoke-test --provider sensenova --workdir /path/to/repo
 deepseek-worker --json stats --hours 8
 ```
@@ -127,7 +158,7 @@ deepseek-worker --json stats --hours 8
 
 ## Testing
 
-`make release-gate` is credential-free and runs deterministic unit, fault-injection, fallback, concurrency, job-isolation, redaction, and install-launcher checks. GitHub Actions runs this same gate for pushes and pull requests. Live Provider soaks are opt-in, consume quota, and require a disposable directory per attempt. The exact commands, metrics, and pass/fail thresholds are in [Release Testing](docs/RELEASE_TESTING.md).
+`make release-gate` is credential-free and runs deterministic unit, fault-injection, fallback, concurrency, job-isolation, redaction, qualification-workspace, and install-launcher checks. GitHub Actions runs this same gate for pushes and pull requests. Live Provider soaks are opt-in, consume quota, and require a disposable directory per attempt. The runner defaults to the actual `auto` route and verifies that reads are non-mutating and writes produce exactly the expected file. The exact commands, metrics, and pass/fail thresholds are in [Release Testing](docs/RELEASE_TESTING.md).
 
 ## Contributing And Security
 
