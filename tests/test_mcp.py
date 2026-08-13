@@ -46,6 +46,29 @@ class RelayMcpTests(unittest.TestCase):
             result = module.call_tool("relay_doctor", {})
         self.assertEqual(json.loads(result["content"][0]["text"]), {"status": "healthy"})
 
+    def test_cached_plugin_resolves_the_installed_launcher(self):
+        with tempfile.TemporaryDirectory() as temporary_home, tempfile.TemporaryDirectory() as temporary_cache:
+            home = Path(temporary_home)
+            launcher = home / ".local/bin/deepseek-worker"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            cached_server = Path(temporary_cache) / "marketplace/plugin/0.10.10/mcp/server.py"
+            cached_server.parent.mkdir(parents=True)
+            cached_server.write_text("# cache placeholder\n", encoding="utf-8")
+            with patch("pathlib.Path.home", return_value=home):
+                self.assertEqual(module.resolve_worker(cached_server), launcher)
+
+    def test_installed_launcher_is_executed_directly(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            launcher = Path(workdir) / "deepseek-worker"
+            launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            completed = __import__("subprocess").CompletedProcess([], 0, '{"status":"healthy"}', "")
+            with patch.object(module, "WORKER", launcher), patch("subprocess.run", return_value=completed) as run:
+                self.assertEqual(module.run_worker(["doctor"]), {"status": "healthy"})
+        self.assertEqual(run.call_args.args[0], [str(launcher), "--json", "doctor"])
+
 
 if __name__ == "__main__":
     unittest.main()

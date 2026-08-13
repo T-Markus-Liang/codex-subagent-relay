@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.9.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.10.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -159,7 +159,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.9 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.10 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
@@ -201,7 +201,7 @@ deepseek-worker --json stats --hours 8
 
 The bundled plugin package exposes the stable Relay lifecycle as local typed MCP tools:
 relay_doctor, relay_launch, relay_status, relay_cancel, and relay_stats. It is a thin stdio facade
-over this repository's Worker command: it does not receive Provider credentials, call a Provider
+over the locally installed Worker launcher: it does not receive Provider credentials, call a Provider
 directly, or mutate Codex Provider/session configuration.
 
 The repository includes a marketplace manifest at `.agents/plugins/marketplace.json`. Add the
@@ -211,6 +211,10 @@ repository as a local or Git marketplace, then install the plugin:
 codex plugin marketplace add /absolute/path/to/codex-subagent-relay
 codex plugin add codex-subagent-relay@codex-subagent-relay
 ```
+
+Install the Worker first with `PYTHON=python3.11 make install-local`. Codex loads plugins from its
+own cache, so the plugin intentionally uses that stable user-local launcher rather than a relative
+path inside the cached package.
 
 For a Git checkout, use the repository URL instead of the local path. Validate the package with the
 Codex plugin validator before installing it in Codex. After installation, start a new Codex thread

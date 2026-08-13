@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +12,20 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-WORKER = REPO_ROOT / "deepseek-worker"
+
+
+def resolve_worker(server_path: Path = Path(__file__)) -> Path:
+    """Find the installed Relay without assuming a plugin cache mirrors the repo."""
+    installed = Path.home() / ".local" / "bin" / "deepseek-worker"
+    if installed.is_file() and os.access(installed, os.X_OK):
+        return installed
+    source_candidate = server_path.resolve().parents[3] / "deepseek-worker"
+    if source_candidate.is_file() and os.access(source_candidate, os.X_OK):
+        return source_candidate
+    return installed
+
+
+WORKER = resolve_worker()
 MAX_TASK_CHARS = 32_768
 MAX_TIMEOUT_SECONDS = 900
 ROLES = (
@@ -69,8 +83,10 @@ def require_object(value: Any) -> dict[str, Any]:
 
 def run_worker(arguments: list[str], timeout: int = 15) -> dict[str, Any]:
     try:
+        if not WORKER.is_file() or not os.access(WORKER, os.X_OK):
+            raise ValueError("Relay launcher is unavailable; run make install-local before enabling the plugin")
         completed = subprocess.run(
-            [sys.executable, str(WORKER), "--json", *arguments],
+            [str(WORKER), "--json", *arguments],
             text=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -152,7 +168,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
     if method == "notifications/initialized":
         return None
     if method == "initialize":
-        return response(message_id, {"protocolVersion": "2024-11-05", "serverInfo": {"name": "codex-subagent-relay", "version": "0.10.9"}, "capabilities": {"tools": {}}})
+        return response(message_id, {"protocolVersion": "2024-11-05", "serverInfo": {"name": "codex-subagent-relay", "version": "0.10.10"}, "capabilities": {"tools": {}}})
     if method == "ping":
         return response(message_id, {})
     if method == "tools/list":
