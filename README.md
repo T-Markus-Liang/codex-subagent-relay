@@ -170,6 +170,19 @@ seven-day window after a Relay/runtime/Provider-policy change; do not combine ol
 experiments, qualification retries, or canaries into a production SLO. The report does not include
 task text and must not be added to Codex Rollout or CC Switch token ledgers.
 
+To create a local static dashboard, first generate the Relay report and separately export the reviewed
+Codex/CC Switch usage audit JSON. The dashboard shows each ledger independently and never adds their
+token totals:
+
+```bash
+python3 /Users/markus/.codex/skills/codex-usage-audit/scripts/codex_usage_audit.py --hours 168 --format json > /tmp/codex-usage.json
+python3.11 scripts/operations_dashboard.py \
+  --relay-report reports/operational-7d.json \
+  --usage-audit /tmp/codex-usage.json \
+  --out reports/operations-dashboard.json \
+  --html-out reports/operations-dashboard.html
+```
+
 Automatic routing maintains a short-lived per-Provider circuit in `~/.codex/deepseek-worker-circuit.json`. Two no-side-effect failures temporarily skip a Provider for 30 seconds, allowing the other route to run without spending its full timeout. Explicit `--provider` diagnostics bypass this state. State persistence is fail-open: an unreadable or unwritable circuit file never blocks a task. Any workspace side effect still stops retry and fallback.
 
 ## Status
