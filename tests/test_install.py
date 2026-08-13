@@ -13,6 +13,9 @@ class InstallTests(unittest.TestCase):
     def test_install_launcher_uses_selected_python(self):
         with tempfile.TemporaryDirectory() as temporary_home:
             environment = {**os.environ, "HOME": temporary_home}
+            launcher = Path(temporary_home) / ".local/bin/deepseek-worker"
+            launcher.parent.mkdir(parents=True)
+            launcher.symlink_to(ROOT / "deepseek-worker")
             installed = subprocess.run(
                 ["make", "install-local", f"PYTHON={sys.executable}"],
                 cwd=ROOT,
@@ -22,8 +25,8 @@ class InstallTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(installed.returncode, 0, installed.stderr)
-            launcher = Path(temporary_home) / ".local/bin/deepseek-worker"
             self.assertTrue(launcher.is_file())
+            self.assertFalse(launcher.is_symlink())
             version = subprocess.run([str(launcher), "--version"], text=True, capture_output=True, check=False)
             self.assertEqual(version.returncode, 0, version.stderr)
             self.assertEqual(version.stdout.strip(), "0.7.1")
