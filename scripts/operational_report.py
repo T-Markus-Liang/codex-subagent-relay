@@ -80,17 +80,21 @@ def report(
     now: datetime | None = None,
     relay_version: str | None = None,
     run_type: str | None = None,
+    telemetry_scope: str | None = None,
+    since: datetime | None = None,
 ) -> dict[str, Any]:
     if not 0 < days <= 365:
         raise ValueError("days must be between 0 and 365")
     now = now or datetime.now(UTC)
-    cutoff = now - timedelta(days=days)
+    cutoff = max(now - timedelta(days=days), since) if since else now - timedelta(days=days)
     rows, invalid = read_rows(log_path, cutoff)
     source_rows = len(rows)
     if relay_version:
         rows = [row for row in rows if row.get("relay_version") == relay_version]
     if run_type:
         rows = [row for row in rows if row.get("run_type", "external_run") == run_type]
+    if telemetry_scope:
+        rows = [row for row in rows if row.get("telemetry_scope") == telemetry_scope]
     by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_provider: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_run_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -104,7 +108,12 @@ def report(
         "utc_window": {"start": cutoff.isoformat(), "end": now.isoformat(), "days": days},
         "log_present": log_path.is_file(),
         "invalid_records_skipped": invalid,
-        "filters": {"relay_version": relay_version, "run_type": run_type},
+        "filters": {
+            "relay_version": relay_version,
+            "run_type": run_type,
+            "telemetry_scope": telemetry_scope,
+            "since": since.isoformat() if since else None,
+        },
         "source_rows_in_window": source_rows,
         "rows_excluded_by_filters": source_rows - len(rows),
         "overall": summarize(rows),
@@ -124,10 +133,13 @@ def main() -> int:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--relay-version", help="Include only telemetry recorded by this Relay version.")
     parser.add_argument("--run-type", help="Include only one run type, for example external_run.")
+    parser.add_argument("--telemetry-scope", choices=("production", "diagnostic", "qualification"), help="Include only one operational scope.")
+    parser.add_argument("--since", help="UTC ISO-8601 lower bound for a clean observation window.")
     args = parser.parse_args()
     try:
-        payload = report(args.log.expanduser(), args.days, relay_version=args.relay_version, run_type=args.run_type)
-    except ValueError as exc:
+        since = datetime.fromisoformat(args.since.replace("Z", "+00:00")).astimezone(UTC) if args.since else None
+        payload = report(args.log.expanduser(), args.days, relay_version=args.relay_version, run_type=args.run_type, telemetry_scope=args.telemetry_scope, since=since)
+    except (TypeError, ValueError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")))
         return 2
     rendered = json.dumps(payload, indent=2)

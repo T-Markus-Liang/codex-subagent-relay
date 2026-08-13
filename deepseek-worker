@@ -27,7 +27,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.6"
+VERSION = "0.10.7"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1272,12 +1272,19 @@ def invoke_codex(
     return result
 
 
-def record_run(payload: dict[str, Any], run_type: str = "external_run") -> None:
+def record_run(
+    payload: dict[str, Any],
+    run_type: str = "external_run",
+    telemetry_scope: str = "production",
+) -> None:
+    if telemetry_scope not in {"production", "diagnostic", "qualification"}:
+        telemetry_scope = "diagnostic"
     risks = payload.get("risks") or []
     record = {
         "timestamp": datetime.now(UTC).isoformat(),
         "relay_version": VERSION,
         "run_type": run_type,
+        "telemetry_scope": telemetry_scope,
         "status": payload.get("status"),
         "provider": payload.get("provider") or "unknown",
         "role": payload.get("role") or "unknown",
@@ -1457,6 +1464,7 @@ def _launch_worker(args: argparse.Namespace) -> dict[str, Any]:
             }
     job_id = f"{int(time.time())}-{secrets.token_hex(6)}"
     metadata_path, stdout_path, stderr_path = job_paths(job_id)
+    telemetry_scope = getattr(args, "telemetry_scope", "production")
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -1472,6 +1480,8 @@ def _launch_worker(args: argparse.Namespace) -> dict[str, Any]:
         args.sandbox,
         "--timeout",
         str(args.timeout),
+        "--telemetry-scope",
+        telemetry_scope,
     ]
     if args.task_file:
         command.extend(("--task-file", str(Path(args.task_file).expanduser().resolve())))
@@ -1851,7 +1861,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 "duration_seconds": 0.0,
             }
             if not args.no_record:
-                record_run(payload, run_type="external_run")
+                record_run(payload, run_type="external_run", telemetry_scope=getattr(args, "telemetry_scope", "production"))
             return payload
     sandbox = args.sandbox if args.sandbox != "auto" else decision["sandbox"]
     lock_handle = None
@@ -1872,7 +1882,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 "duration_seconds": 0.0,
             }
             if not args.no_record:
-                record_run(payload, run_type="external_run")
+                record_run(payload, run_type="external_run", telemetry_scope=getattr(args, "telemetry_scope", "production"))
             return payload
     try:
         return _run_worker_locked(args, task, workdir, decision, selected_provider, provider_order, sandbox)
@@ -2046,7 +2056,7 @@ def _run_worker_locked(
     if automatic and accepted:
         circuit_success(provider)
     if not args.no_record:
-        record_run(payload, run_type="external_run")
+        record_run(payload, run_type="external_run", telemetry_scope=getattr(args, "telemetry_scope", "production"))
     return payload
 
 
@@ -2840,6 +2850,12 @@ def parser() -> argparse.ArgumentParser:
             "--idempotency-key",
             help="Opaque caller key (not retained in plaintext); reuses a matching job in the same workdir.",
         )
+        command_parser.add_argument(
+            "--telemetry-scope",
+            choices=("production", "diagnostic", "qualification"),
+            default="production",
+            help="Operational classification only; qualification normally uses --no-record.",
+        )
         command_parser.add_argument("--no-record", action="store_true")
 
     run_parser = commands.add_parser("run", help="Run one bounded execution task through a DeepSeek profile.")
@@ -2898,25 +2914,25 @@ def main() -> int:
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = native_smoke(args.agent, workdir, args.timeout)
-            record_run(payload, run_type="native_smoke_test")
+            record_run(payload, run_type="native_smoke_test", telemetry_scope="diagnostic")
         elif args.command == "native-v1-canary":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = native_v1_canary(args.provider, workdir, args.timeout, args.parent_model, args.role_layer)
-            record_run(payload, run_type="native_v1_canary")
+            record_run(payload, run_type="native_v1_canary", telemetry_scope="diagnostic")
         elif args.command == "native-role-bisection":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = native_role_bisection(args.provider, workdir, args.timeout, args.parent_model)
-            record_run(payload, run_type="native_role_bisection")
+            record_run(payload, run_type="native_role_bisection", telemetry_scope="diagnostic")
         elif args.command == "cliproxy-native-canary":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = cliproxy_native_canary(workdir, args.timeout, args.parent_model)
-            record_run(payload, run_type="cliproxy_native_canary")
+            record_run(payload, run_type="cliproxy_native_canary", telemetry_scope="diagnostic")
         elif args.command == "route":
             payload = {"status": "success", **route(args.role, args.task)}
         elif args.command == "run":

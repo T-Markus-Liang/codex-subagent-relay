@@ -166,6 +166,8 @@ class RouterTests(unittest.TestCase):
             with patch.object(module, "JOB_ROOT", Path(jobs)), patch.object(module, "workspace_snapshot", return_value={}), patch.object(module.secrets, "token_hex", return_value="abcdef123456"), patch.object(module.subprocess, "Popen", return_value=DummyProcess()) as popen:
                 launched = module.launch_worker(args)
                 self.assertEqual(launched["status"], "running")
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--telemetry-scope") + 1], "production")
                 self.assertEqual(popen.call_args.kwargs["stdin"], module.subprocess.DEVNULL)
                 job_id = launched["job_id"]
                 metadata, stdout, _stderr = module.job_paths(job_id)

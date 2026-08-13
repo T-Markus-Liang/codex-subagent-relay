@@ -152,7 +152,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
     if method == "notifications/initialized":
         return None
     if method == "initialize":
-        return response(message_id, {"protocolVersion": "2024-11-05", "serverInfo": {"name": "codex-subagent-relay", "version": "0.10.6"}, "capabilities": {"tools": {}}})
+        return response(message_id, {"protocolVersion": "2024-11-05", "serverInfo": {"name": "codex-subagent-relay", "version": "0.10.7"}, "capabilities": {"tools": {}}})
     if method == "ping":
         return response(message_id, {})
     if method == "tools/list":

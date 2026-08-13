@@ -244,7 +244,7 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(
             set(record),
             {
-                "timestamp", "relay_version", "run_type", "status", "provider", "role", "duration_seconds",
+                "timestamp", "relay_version", "run_type", "telemetry_scope", "status", "provider", "role", "duration_seconds",
                 "stream_finish_reason", "stream_retry_count", "fallback_used", "partial_write", "usage",
             },
         )
