@@ -10,6 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstallTests(unittest.TestCase):
+    def test_source_entrypoint_requires_python_311(self):
+        first_line = (ROOT / "deepseek-worker").read_text(encoding="utf-8").splitlines()[0]
+        self.assertEqual(first_line, "#!/usr/bin/env python3.11")
+
     def test_install_launcher_uses_selected_python(self):
         with tempfile.TemporaryDirectory() as temporary_home:
             environment = {**os.environ, "HOME": temporary_home}
@@ -29,7 +33,7 @@ class InstallTests(unittest.TestCase):
             self.assertFalse(launcher.is_symlink())
             version = subprocess.run([str(launcher), "--version"], text=True, capture_output=True, check=False)
             self.assertEqual(version.returncode, 0, version.stderr)
-        self.assertEqual(version.stdout.strip(), "0.10.3")
+        self.assertEqual(version.stdout.strip(), "0.10.4")
 
 
 if __name__ == "__main__":

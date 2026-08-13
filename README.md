@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.3.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.4.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -57,7 +57,7 @@ deepseek-worker --version
 deepseek-worker --json doctor
 ```
 
-The installer creates `~/.local/bin/deepseek-worker`; add that directory to `PATH` if needed. It writes a launcher bound to the Python interpreter used during installation, preventing an older system `python3` from running the Worker. A healthy `doctor` report is required before live work.
+The installer creates `~/.local/bin/deepseek-worker`; add that directory to `PATH` if needed. It writes a launcher bound to the Python interpreter used during installation, preventing an older system `python3` from running the Worker. The repository script itself also requires `python3.11` when run directly. A healthy `doctor` report is required before live work.
 
 ## Quick Start
 

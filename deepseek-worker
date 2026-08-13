@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 """Run bounded execution tasks through the configured DeepSeek Codex profiles."""
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.3"
+VERSION = "0.10.4"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -60,6 +60,7 @@ TERMINAL_JOB_STATES = {"succeeded", "partial", "blocked", "failed", "cancelled",
 JOB_TIMEOUT_GRACE_SECONDS = 15
 DEFAULT_TERMINAL_JOB_RETENTION_HOURS = 168
 MAX_TERMINAL_JOB_RETENTION_HOURS = 24 * 365
+NATIVE_ROLE_LAYERS = ("builtin", "minimal", "model-only", "provider-only", "full")
 
 class WorkerError(RuntimeError):
     pass
@@ -850,6 +851,44 @@ def write_native_canary_config(source: Path, destination: Path, agent_provider: 
         raise WorkerError("native canary config became invalid after compatibility filtering") from exc
     destination.write_text(filtered_text, encoding="utf-8")
     os.chmod(destination, 0o600)
+
+
+def native_role_layer_text(agent_type: str, provider: str, layer: str, source: Path | None = None) -> str | None:
+    """Render one isolated role layer without changing the user's registered agent files."""
+    if layer not in NATIVE_ROLE_LAYERS:
+        raise WorkerError(f"unsupported native role layer: {layer}")
+    if layer == "builtin":
+        return None
+    if layer == "full":
+        if source is None or not source.is_file():
+            raise WorkerError(f"native canary role not found: {agent_type}")
+        try:
+            return source.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise WorkerError(f"cannot read native canary role: {type(exc).__name__}") from exc
+    lines = [
+        f"name = {json.dumps(agent_type, ensure_ascii=False)}\n",
+        f"description = {json.dumps(f'isolated native {layer} canary role', ensure_ascii=False)}\n",
+    ]
+    if layer == "model-only":
+        lines.append('model = "deepseek-v4-flash"\n')
+    elif layer == "provider-only":
+        lines.append(f"model_provider = {json.dumps(provider)}\n")
+    return "".join(lines)
+
+
+def write_native_role_layer(destination: Path, agent_type: str, provider: str, layer: str, source: Path) -> bool:
+    """Write a disposable role definition and return whether the role is custom."""
+    rendered = native_role_layer_text(agent_type, provider, layer, source)
+    if rendered is None:
+        return False
+    try:
+        tomllib.loads(rendered)
+    except tomllib.TOMLDecodeError as exc:
+        raise WorkerError("native role layer became invalid TOML") from exc
+    destination.write_text(rendered, encoding="utf-8")
+    os.chmod(destination, 0o600)
+    return True
 
 
 def build_v1_canary_catalog(source: Path, output: Path, parent_model: str) -> None:
@@ -2196,11 +2235,19 @@ def native_smoke(agent_type: str, workdir: Path, timeout: int) -> dict[str, Any]
     }
 
 
-def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_override: str | None = None) -> dict[str, Any]:
+def native_v1_canary(
+    provider: str,
+    workdir: Path,
+    timeout: int,
+    parent_model_override: str | None = None,
+    role_layer: str = "full",
+) -> dict[str, Any]:
     agent_for_provider = {"sensenova": "explorer", "sensenova1": "worker", "opencode-go": "default"}
     agent_type = agent_for_provider.get(provider)
     if agent_type is None:
         raise WorkerError(f"unsupported native canary provider: {provider}")
+    if role_layer not in NATIVE_ROLE_LAYERS:
+        raise WorkerError(f"unsupported native role layer: {role_layer}")
     try:
         with CONFIG_PATH.open("rb") as handle:
             config = tomllib.load(handle)
@@ -2246,9 +2293,7 @@ def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_ov
         isolated_workspace.mkdir()
         write_native_canary_config(CONFIG_PATH, isolated_home / "config.toml", provider)
         role_source = CODEX_HOME / "agents" / f"{agent_type}.toml"
-        if not role_source.is_file():
-            raise WorkerError(f"native canary role not found: {agent_type}")
-        shutil.copy2(role_source, isolated_agents / role_source.name)
+        custom_role = write_native_role_layer(isolated_agents / role_source.name, agent_type, provider, role_layer, role_source)
         for auth_name in ("auth.json", "current_account"):
             auth_source = CODEX_HOME / auth_name
             if auth_source.is_file():
@@ -2304,6 +2349,8 @@ def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_ov
         "root_model_provider": root_provider,
         "parent_model": parent_model,
         "agent_type": agent_type,
+        "role_layer": role_layer,
+        "custom_role": custom_role,
         "expected_provider": provider,
         "spawned": spawned,
         "waited": waited,
@@ -2317,6 +2364,28 @@ def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_ov
         "errors": errors,
         "warnings": warnings,
         "diagnostics": diagnostics,
+    }
+
+
+def native_role_bisection(provider: str, workdir: Path, timeout: int, parent_model_override: str | None = None) -> dict[str, Any]:
+    """Run explicit isolated role layers in order; this is research, never production routing."""
+    results: list[dict[str, Any]] = []
+    for layer in NATIVE_ROLE_LAYERS:
+        result = native_v1_canary(provider, workdir, timeout, parent_model_override, role_layer=layer)
+        results.append(result)
+        # The first failed layer is the bisection result; do not create extra Provider traffic.
+        if result.get("status") != "success":
+            break
+    first_failure = next((item.get("role_layer") for item in results if item.get("status") != "success"), None)
+    return {
+        "status": "success" if len(results) == len(NATIVE_ROLE_LAYERS) and all(item.get("status") == "success" for item in results) else "blocked",
+        "protocol": "v1-role-bisection",
+        "provider": provider,
+        "parent_model": parent_model_override,
+        "layers_attempted": [item["role_layer"] for item in results],
+        "first_failing_layer": first_failure,
+        "results": results,
+        "production_eligible": False,
     }
 
 
@@ -2730,6 +2799,16 @@ def parser() -> argparse.ArgumentParser:
     native_v1_parser.add_argument("--parent-model", help="Override the configured GPT parent for this isolated canary only.")
     native_v1_parser.add_argument("--workdir", default=str(Path.cwd()))
     native_v1_parser.add_argument("--timeout", type=int, default=180)
+    native_v1_parser.add_argument("--role-layer", choices=NATIVE_ROLE_LAYERS, default="full", help="Use one isolated role-definition layer; production remains external.")
+
+    native_bisection_parser = commands.add_parser(
+        "native-role-bisection",
+        help="Explicitly bisect built-in, minimal, model-only, Provider-only, and full V1 role layers in disposable CODEX_HOME instances.",
+    )
+    native_bisection_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
+    native_bisection_parser.add_argument("--parent-model", help="Override the configured GPT parent for this isolated research matrix only.")
+    native_bisection_parser.add_argument("--workdir", default=str(Path.cwd()))
+    native_bisection_parser.add_argument("--timeout", type=int, default=180)
 
     cliproxy_parser = commands.add_parser(
         "cliproxy-native-canary",
@@ -2823,8 +2902,14 @@ def main() -> int:
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
-            payload = native_v1_canary(args.provider, workdir, args.timeout, args.parent_model)
+            payload = native_v1_canary(args.provider, workdir, args.timeout, args.parent_model, args.role_layer)
             record_run(payload, run_type="native_v1_canary")
+        elif args.command == "native-role-bisection":
+            workdir = Path(args.workdir).expanduser().resolve()
+            if not workdir.is_dir():
+                raise WorkerError(f"workdir not found: {workdir}")
+            payload = native_role_bisection(args.provider, workdir, args.timeout, args.parent_model)
+            record_run(payload, run_type="native_role_bisection")
         elif args.command == "cliproxy-native-canary":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():

@@ -37,6 +37,22 @@ def successful_stream(summary: str = "done") -> str:
 
 
 class ReleaseGateTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_dir = tempfile.TemporaryDirectory()
+        root = Path(self.runtime_dir.name)
+        self.patches = [
+            patch.object(module, "CIRCUIT_STATE_PATH", root / "circuit.json"),
+            patch.object(module, "CIRCUIT_LOCK_PATH", root / "circuit.lock"),
+            patch.object(module, "PROVIDER_LOCK_ROOT", root / "provider-locks"),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.runtime_dir.cleanup()
+
     def test_fault_matrix_rejects_bad_streams_and_accepts_only_complete_contracts(self):
         cases = {
             "missing_finish": "\n".join(

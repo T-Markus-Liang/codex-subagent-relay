@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,22 @@ loader.exec_module(module)
 
 
 class RouterTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_dir = tempfile.TemporaryDirectory()
+        root = Path(self.runtime_dir.name)
+        self.patches = [
+            patch.object(module, "CIRCUIT_STATE_PATH", root / "circuit.json"),
+            patch.object(module, "CIRCUIT_LOCK_PATH", root / "circuit.lock"),
+            patch.object(module, "PROVIDER_LOCK_ROOT", root / "provider-locks"),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.runtime_dir.cleanup()
+
     def test_declarative_runtime_config_matches_current_production_policy(self):
         config = module.load_runtime_config(module.ROOT / "relay.toml")
         self.assertEqual(config["fallback"]["read_only"], ("sensenova", "sensenova1"))
@@ -32,6 +49,45 @@ class RouterTests(unittest.TestCase):
             path.write_text(source.replace('adapter = "opencode"', 'adapter = "shell"', 1), encoding="utf-8")
             with self.assertRaises(module.WorkerError):
                 module.load_runtime_config(path)
+
+    def test_native_role_layers_are_minimal_and_do_not_require_user_role_for_builtin(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            source = Path(temporary_dir) / "explorer.toml"
+            source.write_text('name = "explorer"\nmodel = "deepseek-v4-flash"\nmodel_provider = "sensenova"\n', encoding="utf-8")
+            self.assertIsNone(module.native_role_layer_text("explorer", "sensenova", "builtin", source))
+            minimal = tomllib.loads(module.native_role_layer_text("explorer", "sensenova", "minimal", source))
+            model_only = tomllib.loads(module.native_role_layer_text("explorer", "sensenova", "model-only", source))
+            provider_only = tomllib.loads(module.native_role_layer_text("explorer", "sensenova", "provider-only", source))
+            self.assertNotIn("model", minimal)
+            self.assertNotIn("model_provider", minimal)
+            self.assertEqual(model_only["model"], "deepseek-v4-flash")
+            self.assertEqual(provider_only["model_provider"], "sensenova")
+            self.assertEqual(module.native_role_layer_text("explorer", "sensenova", "full", source), source.read_text(encoding="utf-8"))
+
+    def test_native_role_bisection_stops_before_upstream_when_spawn_is_unavailable(self):
+        blocked = {
+            "status": "blocked", "role_layer": "builtin", "spawned": False,
+            "provider_completed": False, "errors": ["agent type is currently not available"],
+        }
+        with patch.object(module, "native_v1_canary", return_value=blocked) as canary:
+            payload = module.native_role_bisection("sensenova", Path.cwd(), 60, "gpt-5.6-sol")
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["layers_attempted"], ["builtin"])
+        self.assertEqual(payload["first_failing_layer"], "builtin")
+        self.assertFalse(payload["production_eligible"])
+        canary.assert_called_once_with("sensenova", Path.cwd(), 60, "gpt-5.6-sol", role_layer="builtin")
+
+    def test_native_role_bisection_continues_to_first_failing_custom_layer(self):
+        outcomes = [
+            {"status": "success", "role_layer": "builtin", "spawned": True},
+            {"status": "success", "role_layer": "minimal", "spawned": True},
+            {"status": "blocked", "role_layer": "model-only", "spawned": True},
+        ]
+        with patch.object(module, "native_v1_canary", side_effect=outcomes) as canary:
+            payload = module.native_role_bisection("sensenova", Path.cwd(), 60)
+        self.assertEqual(payload["layers_attempted"], ["builtin", "minimal", "model-only"])
+        self.assertEqual(payload["first_failing_layer"], "model-only")
+        self.assertEqual(canary.call_count, 3)
 
     def test_opencode_adapter_command_is_scoped_to_role_and_workdir(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
