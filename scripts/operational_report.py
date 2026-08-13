@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Render a source-local seven-day Relay operations report without task content."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from collections import defaultdict
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_LOG = Path.home() / ".codex" / "deepseek-worker-runs.jsonl"
+
+
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
+    return round(ordered[index], 2)
+
+
+def read_rows(path: Path, cutoff: datetime) -> tuple[list[dict[str, Any]], int]:
+    rows: list[dict[str, Any]] = []
+    invalid = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return rows, invalid
+    for line in lines:
+        try:
+            row = json.loads(line)
+            timestamp = datetime.fromisoformat(str(row["timestamp"]).replace("Z", "+00:00"))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            invalid += 1
+            continue
+        if not isinstance(row, dict) or timestamp.tzinfo is None:
+            invalid += 1
+            continue
+        if timestamp >= cutoff:
+            rows.append({**row, "_timestamp": timestamp.astimezone(UTC)})
+    return rows, invalid
+
+
+def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses: dict[str, int] = defaultdict(int)
+    durations: list[float] = []
+    success = fallback = partial = retried = blocked = 0
+    for row in rows:
+        status = str(row.get("status") or "unknown")
+        statuses[status] += 1
+        success += int(status == "success")
+        blocked += int(status == "blocked")
+        fallback += int(bool(row.get("fallback_used")))
+        partial += int(bool(row.get("partial_write")))
+        retried += int(int(row.get("stream_retry_count") or 0) > 0)
+        try:
+            durations.append(float(row.get("duration_seconds") or 0))
+        except (TypeError, ValueError):
+            pass
+    return {
+        "runs": len(rows),
+        "successes": success,
+        "success_rate_percent": round(100 * success / len(rows), 2) if rows else 0.0,
+        "status_counts": dict(sorted(statuses.items())),
+        "p50_duration_seconds": percentile(durations, 0.5),
+        "p95_duration_seconds": percentile(durations, 0.95),
+        "fallback_runs": fallback,
+        "partial_write_runs": partial,
+        "stream_retry_runs": retried,
+        "blocked_runs": blocked,
+    }
+
+
+def report(log_path: Path, days: float, now: datetime | None = None) -> dict[str, Any]:
+    if not 0 < days <= 365:
+        raise ValueError("days must be between 0 and 365")
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=days)
+    rows, invalid = read_rows(log_path, cutoff)
+    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_provider: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_run_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_day[row["_timestamp"].date().isoformat()].append(row)
+        by_provider[str(row.get("provider") or "unknown")].append(row)
+        by_run_type[str(row.get("run_type") or "external_run")].append(row)
+    return {
+        "status": "success",
+        "source": "relay_operational_telemetry",
+        "utc_window": {"start": cutoff.isoformat(), "end": now.isoformat(), "days": days},
+        "log_present": log_path.is_file(),
+        "invalid_records_skipped": invalid,
+        "overall": summarize(rows),
+        "daily": {key: summarize(value) for key, value in sorted(by_day.items())},
+        "providers": {key: summarize(value) for key, value in sorted(by_provider.items())},
+        "run_types": {key: summarize(value) for key, value in sorted(by_run_type.items())},
+        "coverage_warning": (
+            "Relay telemetry is operational evidence only. Do not add its token or run totals to Codex Rollout or CC Switch ledgers; use the separate codex-usage-audit workflow for those sources."
+        ),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--days", type=float, default=7)
+    parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
+    parser.add_argument("--out", type=Path)
+    args = parser.parse_args()
+    try:
+        payload = report(args.log.expanduser(), args.days)
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")))
+        return 2
+    rendered = json.dumps(payload, indent=2)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

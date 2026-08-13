@@ -114,6 +114,19 @@ request bodies, response bodies, thread ids, credentials, or raw logs.
 role/Provider success rates, p50/p95 durations, fallback count, partial-write count, and stream-retry
 count. It is an operational indicator, not an accounting ledger for Codex or Provider billing.
 
+For the required seven-day operational observation, generate a source-local UTC report at the end of
+each day and preserve only the redacted aggregate report:
+
+```bash
+python3.11 scripts/operational_report.py --days 7 --out reports/operational-7d.json
+```
+
+Only a clean post-release window is eligible: exclude earlier versions, live-qualification attempts,
+manual fault injection, and native canaries from the external production SLO. Review the report's
+daily and per-Provider success rate, P50/P95, fallback, stream retry, partial-write, and blocked
+counts. Its Relay telemetry must remain separate from the Codex Rollout and CC Switch token ledgers;
+use the documented `codex-usage-audit` workflow to report those sources.
+
 ## Suggested Publication Policy
 
 Do not advertise a Provider reliability guarantee from an ad-hoc smoke test. A maintainable initial
