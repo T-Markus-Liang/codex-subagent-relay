@@ -35,20 +35,21 @@ def task_for(role: str) -> str:
     return "Create exactly one file named soak.txt containing exactly the bytes deepseek-worker soak with no trailing newline. Use the shell command printf %s to write it, then use od to verify its bytes. Do not modify any other file. Return only the required five-field JSON."
 
 
-def verify_workspace(workdir: Path, role: str) -> tuple[bool, str]:
+def verify_workspace(workdir: Path, role: str) -> tuple[bool, bool, str]:
+    """Return (safe, expected_output, reason) without confusing a no-op failure with a bad write."""
     paths = sorted(path.name for path in workdir.iterdir())
     if role == "repository-exploration":
-        return (not paths, "ok" if not paths else "read-only workspace changed")
+        return (not paths, not paths, "ok" if not paths else "read-only workspace changed")
+    if not paths:
+        return True, False, "write task produced no output"
     expected = [SOAK_FILENAME]
     if paths != expected:
-        return False, "write task created unexpected paths"
+        return False, False, "write task created unexpected paths"
     try:
-        return (
-            (workdir / SOAK_FILENAME).read_text(encoding="utf-8") == SOAK_CONTENT,
-            "ok" if (workdir / SOAK_FILENAME).read_text(encoding="utf-8") == SOAK_CONTENT else "write content mismatch",
-        )
+        output_matches = (workdir / SOAK_FILENAME).read_text(encoding="utf-8") == SOAK_CONTENT
+        return output_matches, output_matches, "ok" if output_matches else "write content mismatch"
     except OSError:
-        return False, "write output unreadable"
+        return False, False, "write output unreadable"
 
 
 def failure_class(payload: dict, workspace_reason: str) -> str | None:
@@ -153,7 +154,7 @@ def main() -> int:
                     "--timeout", str(args.timeout), "--no-record", "--task", task_for(args.role),
                 ]
                 payload, duration = run_job(args.worker, command, args.poll_seconds, args.job_deadline)
-                workspace_ok, workspace_reason = verify_workspace(Path(temporary_dir), args.role)
+                workspace_safe, expected_output, workspace_reason = verify_workspace(Path(temporary_dir), args.role)
                 records.append({
                     "run": index,
                     "status": payload.get("status", "invalid-output"),
@@ -163,7 +164,8 @@ def main() -> int:
                     "stream_retry_count": payload.get("stream_retry_count", 0),
                     "fallback_used": "provider fallback was used after an earlier DeepSeek route failed" in (payload.get("risks") or []),
                     "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
-                    "workspace_ok": workspace_ok,
+                    "workspace_safe": workspace_safe,
+                    "expected_output": expected_output,
                     "failure_class": failure_class(payload, workspace_reason),
                 })
         except KeyboardInterrupt:
@@ -171,7 +173,7 @@ def main() -> int:
             break
 
     durations = [record["duration_seconds"] for record in records]
-    successes = sum(record["status"] == "success" and record["workspace_ok"] for record in records)
+    successes = sum(record["status"] == "success" and record["expected_output"] for record in records)
     report = {
         "timestamp": datetime.now(UTC).isoformat(),
         "worker": args.worker,
@@ -192,14 +194,15 @@ def main() -> int:
         "stream_finish_counts": {reason: sum(record["stream_finish_reason"] == reason for record in records) for reason in sorted({record["stream_finish_reason"] for record in records}, key=str)},
         "fallback_runs": sum(record["fallback_used"] for record in records),
         "partial_write_runs": sum(record["partial_write"] for record in records),
-        "workspace_verification_failures": sum(not record["workspace_ok"] for record in records),
+        "workspace_verification_failures": sum(not record["workspace_safe"] for record in records),
+        "expected_output_failures": sum(not record["expected_output"] for record in records),
         "duplicate_write_incidents": (
             0
-            if args.role == "documentation" and all(record["workspace_ok"] and not record["partial_write"] for record in records)
+            if args.role == "documentation" and all(record["workspace_safe"] and not record["partial_write"] for record in records)
             else None
         ),
         "write_safety_violations": (
-            sum(record["partial_write"] or not record["workspace_ok"] for record in records)
+            sum(record["partial_write"] or not record["workspace_safe"] for record in records)
             if args.role == "documentation"
             else 0
         ),

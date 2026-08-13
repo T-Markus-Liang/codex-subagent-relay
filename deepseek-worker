@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.10.0"
+VERSION = "0.10.1"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -35,6 +35,7 @@ CONFIG_PATH = CODEX_HOME / "config.toml"
 RUN_LOG_PATH = CODEX_HOME / "deepseek-worker-runs.jsonl"
 CIRCUIT_STATE_PATH = CODEX_HOME / "deepseek-worker-circuit.json"
 CIRCUIT_LOCK_PATH = CODEX_HOME / "deepseek-worker-circuit.lock"
+PROVIDER_LOCK_ROOT = CODEX_HOME / "deepseek-worker-provider-locks"
 JOB_ROOT = CODEX_HOME / "deepseek-worker-jobs"
 MAX_FALLBACK_SNAPSHOT_FILES = 10000
 DEFAULT_CATALOG_PATH = CODEX_HOME / "deepseek-subagent-model-catalog.json"
@@ -440,6 +441,23 @@ def workdir_lock(workdir: Path):
     handle.seek(0)
     handle.truncate()
     handle.write(json.dumps({"workdir": str(workdir), "pid": os.getpid()}, separators=(",", ":")))
+    handle.flush()
+    return handle
+
+
+def provider_lease(provider: str):
+    """Acquire one local execution slot per upstream Provider without queueing callers."""
+    lock_path = PROVIDER_LOCK_ROOT / f"{provider}.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise WorkerError(f"provider {provider} is already executing another Relay task") from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({"provider": provider, "pid": os.getpid()}, separators=(",", ":")))
     handle.flush()
     return handle
 
@@ -1825,73 +1843,85 @@ def _run_worker_locked(
     last_stream = {"finish_reason": None, "failure": None}
     provider = selected_provider
     profile = PROVIDERS[provider]["profile"]
+    provider_busy = False
     for attempt_index, provider in enumerate(provider_order):
         profile = PROVIDERS[provider]["profile"]
-        command = adapter_command(provider, workdir, decision["role"], sandbox, task)
-        provider_deadline = time.monotonic() + attempt_timeouts[attempt_index]
-        stream_retry_count = 0
-        while True:
-            remaining_seconds = max(1, int(provider_deadline - time.monotonic()))
-            try:
-                completed = invoke_codex(
-                    command,
-                    workdir,
-                    remaining_seconds,
-                    env={**os.environ, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "131072"},
-                )
-            except FileNotFoundError as exc:
-                raise WorkerError("opencode command not found") from exc
-            message, usage, invalid_result, task_activity = parse_worker_events(completed.stdout)
-            stream = opencode_stream_diagnostics(completed.stdout)
-            last_stream = stream
-            for key, value in usage.items():
-                total_usage[key] = total_usage.get(key, 0) + value
-            attempt_snapshot = workspace_snapshot(workdir)
-            attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
-            current_snapshot = attempt_snapshot
-            declared_changes = set(message.get("files_changed", [])) if message is not None else set()
-            declared_mismatch = bool(message is not None and declared_changes != set(attempt_changes))
-            if (
-                completed.returncode == 0
-                and message is not None
-                and task_activity
-                and not declared_mismatch
-                and stream["failure"] is None
-            ):
-                accepted = True
-                break
-            attempt_label = provider if stream_retry_count == 0 else f"{provider} retry"
-            attempts.append(
-                {
-                    "provider": attempt_label,
-                    "error": (
-                        "declared files do not match the real workdir diff"
-                        if declared_mismatch
-                        else str(stream["failure"])
-                        if stream["failure"] is not None
-                        else "invalid structured worker result"
-                        if invalid_result or message is None
-                        else "no task tool activity"
-                        if not task_activity
-                        else redact(completed.stderr or completed.stdout, 300)
-                    ),
-                }
-            )
-            if attempt_changes:
-                side_effect_attempt = {"provider": provider, "files_changed": attempt_changes}
-                break
+        try:
+            lease_handle = provider_lease(provider)
+        except WorkerError as exc:
+            attempts.append({"provider": provider, "error": str(exc)})
+            provider_busy = True
             if automatic:
-                circuit_failure(provider)
-            retry_budget = int(provider_deadline - time.monotonic())
-            if stream["failure"] is not None and stream_retry_count == 0 and retry_budget >= 5:
-                stream_retry_count += 1
-                used_stream_retry = True
                 continue
             break
+        try:
+            command = adapter_command(provider, workdir, decision["role"], sandbox, task)
+            provider_deadline = time.monotonic() + attempt_timeouts[attempt_index]
+            stream_retry_count = 0
+            while True:
+                remaining_seconds = max(1, int(provider_deadline - time.monotonic()))
+                try:
+                    completed = invoke_codex(
+                        command,
+                        workdir,
+                        remaining_seconds,
+                        env={**os.environ, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "131072"},
+                    )
+                except FileNotFoundError as exc:
+                    raise WorkerError("opencode command not found") from exc
+                message, usage, invalid_result, task_activity = parse_worker_events(completed.stdout)
+                stream = opencode_stream_diagnostics(completed.stdout)
+                last_stream = stream
+                for key, value in usage.items():
+                    total_usage[key] = total_usage.get(key, 0) + value
+                attempt_snapshot = workspace_snapshot(workdir)
+                attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
+                current_snapshot = attempt_snapshot
+                declared_changes = set(message.get("files_changed", [])) if message is not None else set()
+                declared_mismatch = bool(message is not None and declared_changes != set(attempt_changes))
+                if (
+                    completed.returncode == 0
+                    and message is not None
+                    and task_activity
+                    and not declared_mismatch
+                    and stream["failure"] is None
+                ):
+                    accepted = True
+                    break
+                attempt_label = provider if stream_retry_count == 0 else f"{provider} retry"
+                attempts.append(
+                    {
+                        "provider": attempt_label,
+                        "error": (
+                            "declared files do not match the real workdir diff"
+                            if declared_mismatch
+                            else str(stream["failure"])
+                            if stream["failure"] is not None
+                            else "invalid structured worker result"
+                            if invalid_result or message is None
+                            else "no task tool activity"
+                            if not task_activity
+                            else redact(completed.stderr or completed.stdout, 300)
+                        ),
+                    }
+                )
+                if attempt_changes:
+                    side_effect_attempt = {"provider": provider, "files_changed": attempt_changes}
+                    break
+                if automatic:
+                    circuit_failure(provider)
+                retry_budget = int(provider_deadline - time.monotonic())
+                if stream["failure"] is not None and stream_retry_count == 0 and retry_budget >= 5:
+                    stream_retry_count += 1
+                    used_stream_retry = True
+                    continue
+                break
+        finally:
+            fcntl.flock(lease_handle.fileno(), fcntl.LOCK_UN)
+            lease_handle.close()
         if accepted or side_effect_attempt is not None:
             break
     duration = round(time.monotonic() - started, 2)
-    assert completed is not None
     after = workspace_snapshot(workdir)
     detected = changed_workspace_paths(before, after)
 
@@ -1916,11 +1946,11 @@ def _run_worker_locked(
         }
     elif not accepted:
         payload = {
-            "status": "error",
+            "status": "blocked" if provider_busy and all("already executing another Relay task" in item["error"] for item in attempts) else "error",
             "provider": provider,
             "profile": profile,
             "role": decision["role"],
-            "summary": "DeepSeek worker did not complete successfully.",
+            "summary": "All eligible DeepSeek providers are currently busy." if provider_busy and all("already executing another Relay task" in item["error"] for item in attempts) else "DeepSeek worker did not complete successfully.",
             "files_changed": detected,
             "tests": [],
             "risks": ["all DeepSeek providers failed", *[f"{item['provider']}: {item['error']}" for item in attempts]],

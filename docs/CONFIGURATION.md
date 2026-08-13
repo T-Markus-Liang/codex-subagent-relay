@@ -89,3 +89,11 @@ Provider configuration, or run-log aggregation.
 ## Automatic Provider Circuit
 
 Automatic runs persist a small private circuit state file at `~/.codex/deepseek-worker-circuit.json`, protected by a local lock and atomically replaced. After two no-side-effect failures for one Provider, that Provider is skipped for 30 seconds. A successful run clears its state. Explicit `--provider` runs bypass the circuit for diagnostics and recovery. If the state file cannot be read or written, routing fails open and continues normally. A write-side effect never triggers automatic replay or Provider fallback.
+
+## Local Provider Leases
+
+The Relay permits one active local execution per upstream Provider. This prevents multiple Codex
+tasks or a qualification batch from overloading one route. An automatic request skips a busy route
+and tries the next configured route. An explicit Provider request returns a bounded `blocked`
+terminal result without contacting the Provider. Provider leases are process-local coordination,
+not a distributed quota or availability guarantee.

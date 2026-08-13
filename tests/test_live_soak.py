@@ -17,17 +17,24 @@ class LiveSoakTests(unittest.TestCase):
     def test_read_only_workspace_must_remain_empty(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             workdir = Path(temporary_dir)
-            self.assertEqual(module.verify_workspace(workdir, "repository-exploration"), (True, "ok"))
+            self.assertEqual(module.verify_workspace(workdir, "repository-exploration"), (True, True, "ok"))
             (workdir / "unexpected.txt").write_text("x", encoding="utf-8")
-            self.assertEqual(module.verify_workspace(workdir, "repository-exploration"), (False, "read-only workspace changed"))
+            self.assertEqual(module.verify_workspace(workdir, "repository-exploration"), (False, False, "read-only workspace changed"))
 
     def test_write_workspace_requires_exact_single_file_and_content(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             workdir = Path(temporary_dir)
             (workdir / module.SOAK_FILENAME).write_text(module.SOAK_CONTENT, encoding="utf-8")
-            self.assertEqual(module.verify_workspace(workdir, "documentation"), (True, "ok"))
+            self.assertEqual(module.verify_workspace(workdir, "documentation"), (True, True, "ok"))
             (workdir / "extra.txt").write_text("x", encoding="utf-8")
-            self.assertEqual(module.verify_workspace(workdir, "documentation"), (False, "write task created unexpected paths"))
+            self.assertEqual(module.verify_workspace(workdir, "documentation"), (False, False, "write task created unexpected paths"))
+
+    def test_failed_write_with_no_files_is_not_a_workspace_safety_violation(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            self.assertEqual(
+                module.verify_workspace(Path(temporary_dir), "documentation"),
+                (True, False, "write task produced no output"),
+            )
 
     def test_write_task_requires_exact_no_newline_bytes(self):
         self.assertIn("printf %s", module.task_for("documentation"))

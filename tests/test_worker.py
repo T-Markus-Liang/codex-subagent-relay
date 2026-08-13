@@ -825,6 +825,26 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["provider"], fallback[1])
         self.assertIn("provider fallback was used after an earlier DeepSeek route failed", payload["risks"])
 
+    def test_explicit_busy_provider_returns_fast_blocked_terminal(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(
+                task="inspect files",
+                task_file=None,
+                role="repository-exploration",
+                workdir=workdir,
+                provider="sensenova",
+                sandbox="read-only",
+                timeout=90,
+                no_record=True,
+            )
+            with patch.object(module, "provider_lease", side_effect=module.WorkerError("provider sensenova is already executing another Relay task")), \
+                 patch.object(module, "invoke_codex") as invoke:
+                payload = module.run_worker(args)
+        invoke.assert_not_called()
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["files_changed"], [])
+        self.assertIn("currently busy", payload["summary"])
+
     def test_length_finish_retries_same_provider_once_with_output_limit(self):
         truncated = "\n".join(map(json.dumps, [
             {"type": "tool_use", "part": {"state": {"status": "completed"}}},

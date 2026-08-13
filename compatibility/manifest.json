@@ -1,5 +1,5 @@
 {
-  "relay_version": "0.10.0",
+  "relay_version": "0.10.1",
   "minimum_python": "3.11",
   "adapter": "opencode",
   "production_routes": [

@@ -90,10 +90,18 @@ python3 scripts/qualify_manifest.py \
   --out /tmp/manifest-sensenova1.json
 ```
 
-The converter rejects `auto` reports, short batches, rates below 95%, workspace failures, partial
-writes, and missing explicit zero-duplicate evidence. Review the candidate, then replace the tracked
+The runner reports safety and task completion separately: a failed write that leaves an empty
+disposable workdir is a no-side-effect task failure, not a workspace safety violation. Any unexpected
+file, wrong bytes, or partial write remains a safety violation. The converter rejects `auto` reports,
+short batches, rates below 95%, workspace safety failures, partial writes, and missing explicit
+zero-duplicate evidence. Review the candidate, then replace the tracked
 manifest only as part of the release commit. Once every production route is represented, run
 `python3 scripts/validate_compatibility.py --require-evidence`.
+
+Run one explicit qualification batch per Provider at a time. Relay now uses a local one-slot lease
+per Provider: an explicit run returns `blocked` while that route is executing another Relay task;
+an automatic production task can use the next route instead. Do not treat a batch run while other
+tasks share the Provider as qualification evidence.
 
 For a concurrency experiment, keep write tasks pointed at one workdir and verify all but one return `blocked`; use separate disposable workdirs for read-only parallelism. Record the exact concurrency level, start method, status counts, p50/p95 duration, stream failure reasons, fallback count, and partial-write count. Do not publish a concurrency guarantee beyond the highest fully observed level.
 
