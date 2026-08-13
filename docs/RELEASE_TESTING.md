@@ -13,7 +13,7 @@ make release-gate
 The gate is deterministic and uses no network, model account, API key, task body, or real project.
 It must pass completely. It verifies:
 
-- Python compilation and the full unit suite.
+- Python compilation and the full unit suite, including an isolated install-launcher regression test.
 - Strict five-field result contracts and rejection of malformed, guessed, no-tool, stream-error,
   missing-finish, and length-truncated results.
 - Bounded two-provider fallback under repeated bad primary responses.
@@ -22,6 +22,22 @@ It must pass completely. It verifies:
 - Run metadata excludes task text and secret-like result content.
 - Real workspace changes stop automatic retry and Provider fallback.
 - Native canaries remain evidence-only and must never promote a production route automatically.
+
+GitHub Actions runs this same command on every pull request and push to `main`. It has read-only repository permissions and receives no Provider credentials.
+
+## Offline Stress Matrix
+
+The release gate is a deterministic stress test of relay behavior, not a claim about remote Provider reliability.
+
+| Scenario | Test shape | Required result |
+| --- | --- | --- |
+| Stream faults | malformed, guessed, no-tool, error, missing-finish, and length-truncated streams | no invalid result accepted |
+| Fallback | 32 repeated invalid-primary / valid-secondary sequences | bounded retry and only valid secondary acceptance |
+| Write contention | 12 simultaneous lock contenders for one workdir | exactly one owner, 11 blocked |
+| Job isolation | 24 concurrent `launch` operations | unique job IDs and metadata/stdout/stderr paths |
+| Data protection | synthetic task and secret-like risk content | neither persisted in run metadata |
+| Side effects | invalid result after workspace change | no retry or Provider fallback |
+| Install portability | temporary-home install with selected Python | installed launcher invokes that Python |
 
 ## Optional Live Provider Soak
 
@@ -52,6 +68,8 @@ python3 scripts/live_soak.py --confirm-live --provider sensenova1 --role documen
 
 Its report contains aggregates only. A nonzero exit means at least one run did not complete.
 
+For a concurrency experiment, keep write tasks pointed at one workdir and verify all but one return `blocked`; use separate disposable workdirs for read-only parallelism. Record the exact concurrency level, start method, status counts, p50/p95 duration, stream failure reasons, fallback count, and partial-write count. Do not publish a concurrency guarantee beyond the highest fully observed level.
+
 Record only: timestamp, Worker version, role, provider route, status, duration, stream finish
 reason, retry/fallback flags, and redacted aggregate usage. Do not publish prompts, workspace paths,
 request bodies, response bodies, thread ids, credentials, or raw logs.
@@ -74,3 +92,7 @@ policy is:
 If the live route misses a threshold, publish the observed failure classes and keep that route
 experimental or disabled from automatic fallback. The gate should make a bad release visible, not
 hide an upstream reliability problem.
+
+## Evidence Boundary
+
+The CI badge proves only the offline gate for its referenced commit. It does not prove third-party Provider availability, latency, tool quality, quota, or success rate. Native V1/V2 Agent Team paths remain experimental and must be reported separately from external Worker `run`/`launch` results.

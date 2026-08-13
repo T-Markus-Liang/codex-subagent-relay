@@ -1,94 +1,132 @@
 # Codex Subagent Relay
 
+[![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
+
 Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
-debugging, and documentation tasks in a provider-backed worker with strict result contracts,
+debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
 side-effect protection, bounded fallback, and release gates.
 
 It does not alter Codex account authentication, root Provider identity, or conversation history.
 It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, OpenCode, or CLIProxyAPI.
 
-## Install
+## What It Does
+
+- Routes read-heavy work to one configured third-party route and write-heavy work to another.
+- Requires real tool activity, a healthy terminal stream, a strict five-field JSON result, and a matching workspace diff before accepting a result.
+- Retries a stream failure once, then uses bounded Provider fallback only when the workspace is unchanged.
+- Stops on a partial write rather than replaying the task with another Provider.
+- Keeps native Codex Agent Team integrations canary-only.
+
+It does **not** provision Provider accounts, API keys, OpenCode, Codex profiles, local bridges, or a third-party Provider. This is a local relay around an already-working integration.
+
+## Requirements
+
+- macOS or Linux with Python 3.11+ and `make`. Windows is unsupported because the write lock uses POSIX `fcntl`.
+- Codex CLI/Desktop available on `PATH`.
+- OpenCode installed at `~/.opencode/bin/opencode`, or an alternate executable path supplied with `DEEPSEEK_WORKER_OPENCODE_PATH`.
+- A private Provider integration exposing all currently named OpenCode model IDs: `sensenova/deepseek-v4-flash`, `sensenova1/deepseek-v4-flash`, and `opencode-go/deepseek-v4-flash`. The current `doctor` command checks all three slots, even though `opencode-go` is diagnostic-only in automatic routing.
+- Matching Codex profile files and local health endpoints. See [Configuration](docs/CONFIGURATION.md).
+
+The repository never needs Provider credentials. Keep credentials in your Provider/OpenCode configuration; do not put them in task files, shell arguments, commits, CI secrets, or issue reports.
+
+## Install And Verify
 
 ```bash
-make install-local
+git clone https://github.com/T-Markus-Liang/codex-subagent-relay.git
+cd codex-subagent-relay
+PYTHON=python3.11 make release-gate
+PYTHON=python3.11 make install-local
+deepseek-worker --version
+deepseek-worker --json doctor
 ```
 
-The installer creates `~/.local/bin/deepseek-worker`; add that directory to `PATH` if needed.
-Use Python 3.11 or later.
+The installer creates `~/.local/bin/deepseek-worker`; add that directory to `PATH` if needed. It writes a launcher bound to the Python interpreter used during installation, preventing an older system `python3` from running the Worker. A healthy `doctor` report is required before live work.
+
+## Quick Start
+
+Inspect routing without contacting a model:
+
+```bash
+deepseek-worker --json route --role repository-exploration
+deepseek-worker --json route --role implementation
+```
+
+Run a bounded read-only task synchronously. This consumes Provider quota:
+
+```bash
+deepseek-worker --json run \
+  --role repository-exploration \
+  --workdir "$(pwd)" \
+  --provider auto \
+  --task "Inspect the repository structure only. Do not modify files. Return the required JSON result."
+```
+
+For execution work, use the non-blocking interface and poll the same job instead of launching duplicates:
+
+```bash
+deepseek-worker --json launch \
+  --role implementation \
+  --workdir /absolute/path/to/repository \
+  --provider auto \
+  --task-file /absolute/path/to/bounded-task.md
+
+deepseek-worker --json poll --job-id <job_id>
+```
+
+`poll` can return `{"status":"running"}` while the Worker is active. Wait and poll the same job again. Do not start a second job for the same write task. Use `--task-file` for substantial briefs, and never include credentials or raw request data in it.
+
+Every accepted terminal result has this exact core contract:
+
+```json
+{
+  "status": "success",
+  "summary": "concise result",
+  "files_changed": ["relative/path"],
+  "tests": ["command: passed"],
+  "risks": []
+}
+```
+
+The relay adds bounded metadata such as Provider, duration, usage, and stream retry count. Independently inspect `files_changed`, `git diff`, and the listed tests before accepting any write.
+
+## Routing And Safety
+
+| Role family | Default Provider order | Sandbox | Default budget |
+| --- | --- | --- | --- |
+| `search`, `repository-exploration`, `logs` | `sensenova -> sensenova1` | read-only | 75 seconds |
+| `implementation`, `test`, `debug`, `refactor`, `docs` | `sensenova1 -> sensenova` | workspace-write | 120 seconds |
+| architecture, planning, final review | kept by the caller | n/a | n/a |
+
+`opencode-go` is available only with an explicit `--provider` for diagnostics; it is not part of automatic production fallback. The Worker serializes concurrent write tasks per workdir. A write that changes files but fails the result contract returns `partial` and stops all retry/fallback. Review that diff manually.
+
+Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`.
 
 ## Status
 
-This project is experimental. The offline safety gate is deterministic and enforced in CI, but live
-Provider reliability depends on services outside this repository. Do not use it for unattended or
-irreversible production changes until your own live soak results meet the policy in
-[`docs/RELEASE_TESTING.md`](docs/RELEASE_TESTING.md).
-
-## Release Gate
-
-Run the credential-free release gate before every public release and in CI:
-
-```bash
-make release-gate
-```
-
-It compiles the Worker and runs deterministic tests for result-contract rejection, stream failures,
-bounded fallback, write-lock contention, concurrent job isolation, and run-log redaction. It does not
-call a model, contact a Provider, read task bodies, or require a Codex account.
-
-The full offline/live test protocol and publication thresholds are in
-[`docs/RELEASE_TESTING.md`](docs/RELEASE_TESTING.md). The included GitHub Actions workflow runs only
-the offline gate; it never receives provider credentials.
-
-Live Provider tests are deliberately manual because they consume quota and measure an upstream that
-is outside this repository. Run `deepseek-worker --json doctor`, then launch small, disposable,
-single-task read and write smokes. Record Provider, timestamp, completion rate, p50/p95 duration,
-stream failure classes, fallback rate, and partial-write rate in a release report. Do not claim a
-Provider SLO from fewer than 100 completed attempts per route; keep native V1/V2 results separate.
+This project is experimental. The offline safety gate is deterministic and enforced in CI, but live Provider reliability depends on services outside this repository. Do not use it for unattended or irreversible production changes until your own live soak results meet the policy in [Release Testing](docs/RELEASE_TESTING.md).
 
 ## Commands
 
 ```bash
 deepseek-worker --json doctor
-deepseek-worker --json catalog-build
-deepseek-worker --json native-check
-deepseek-worker --json native-v1-canary --provider sensenova --workdir /path/to/repo
-deepseek-worker --json cliproxy-native-canary --parent-model gpt-5.6-sol --workdir /path/to/repo
 deepseek-worker --json route --role implementation
 deepseek-worker --json run --task-file task.md --role implementation --workdir /path/to/repo
+deepseek-worker --json launch --task-file task.md --role implementation --workdir /path/to/repo
+deepseek-worker --json poll --job-id <job_id>
 deepseek-worker --json smoke-test --provider sensenova --workdir /path/to/repo
 deepseek-worker --json stats --hours 8
 ```
 
-`run` invokes OpenCode directly with `sensenova/deepseek-v4-flash`, `sensenova1/deepseek-v4-flash`, or `opencode-go/deepseek-v4-flash`. Read-heavy roles use OpenCode's `plan` agent; implementation roles use its `build` agent. The separate Codex profile-v2 bridge remains available for native canaries. Production runs do not change the Codex App root provider or create Codex task threads.
+`run` invokes OpenCode directly with the configured third-party model IDs. Read-heavy roles use OpenCode's `plan` agent; implementation roles use its `build` agent. Production runs do not change Codex App root Provider or create Codex task threads.
 
-With `--provider auto`, the worker uses two bounded SenseNova routes: read-only work uses `sensenova -> sensenova1`, while write-heavy and general work use `sensenova1 -> sensenova`. The default read-only budget is 75 seconds (55s primary, 20s fallback); the write/general budget is 120 seconds (90s primary, 30s fallback). A positive `--timeout` overrides the role default. `opencode-go` remains available only when explicitly selected for diagnostics; it is excluded from automatic production fallback after slow unreliable runs. Worker subprocesses set `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=131072` without modifying the user's shell or OpenCode configuration.
+`catalog-build`, `native-check`, `native-v1-canary`, and `cliproxy-native-canary` are experimental diagnostics. Native V1/V2 results do not establish production route reliability. See [Configuration](docs/CONFIGURATION.md) and [Release Testing](docs/RELEASE_TESTING.md).
 
-A result is accepted only when OpenCode records real tool activity, emits a healthy terminal `step_finish`, and the final text contains the five-field JSON contract. Missing finish frames, `length`, `error`, `unknown`, `other`, and zero usable output are stream failures. When such a failure leaves the workspace unchanged, the Worker retries that Provider once inside its original timeout budget before normal Provider fallback. Token usage is aggregated across every attempt.
+## Testing
 
-`stats --hours` reports status counts, per-provider success rates and durations, and input, cached input, cache-write, output, reasoning, request, and context Token totals without reading task bodies.
+`make release-gate` is credential-free and runs deterministic unit, fault-injection, fallback, concurrency, job-isolation, redaction, and install-launcher checks. GitHub Actions runs this same gate for pushes and pull requests. Live Provider soaks are opt-in, consume quota, and require a disposable directory per attempt. The exact commands, metrics, and pass/fail thresholds are in [Release Testing](docs/RELEASE_TESTING.md).
 
-If a write attempt changes the workspace but returns an invalid contract or unhealthy stream terminal, the Worker returns `partial` and stops retry/fallback immediately. This prevents another attempt from repeating or overwriting the first write; the main model must review the existing diff before deciding what remains. For no-side-effect errors, let the one automatic fallback complete; retry the bounded job only once when it remains justified, otherwise hand it back to the main model immediately.
+## Contributing And Security
 
-The installed command uses `/opt/homebrew/bin/python3` because the macOS system Python is too old for Codex's TOML configuration parsing.
-
-## JSON contract
-
-Successful runs return `status`, `summary`, `files_changed`, `tests`, `risks`, provider/profile metadata, bounded usage counters, duration, and non-sensitive stream diagnostics (`stream_finish_reason`, `stream_retry_count`). The parser accepts exact, fenced, or prose-wrapped JSON and normalizes common completion aliases. It also repairs only three known safe empty-list variants: `files_changed: 0`, `tests: "none"`, and `risks: "none"`. The exact five-field shape and all other types remain strict. Errors use `{"status":"error","error":"..."}` or the same structured result shape with bounded, redacted risk text.
-
-Run metadata is appended to `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`. Task bodies, model responses, credentials, and raw logs are never stored there.
-
-`catalog-build` writes a candidate catalog that preserves the live GPT model list and appends DeepSeek. It does not modify `config.toml` or enable that catalog globally. `native-check` loads the separate `ds-native-catalog-test` profile.
-
-`cliproxy-native-canary` uses an isolated `CODEX_HOME` and the local CLIProxyAPI canary service. It
-routes the Sol parent and a Codex-safe `gpt-5.6-luna` alias through CLIProxyAPI, then discovers the
-unique child from the isolated state DB and inspects its rollout. The child must read two hidden
-workspace tokens through parallel shell calls, return matching tool outputs, and emit the strict
-five-field JSON contract. A parent-visible JSON response alone never passes.
-
-As of 2026-08-13, native V1 and V2 routes are experimental only. The V1 canary now uses a minimal
-version-compatible isolated config and creates an isolated state DB, but the current Desktop run is
-blocked at `spawn_agent` with `agent type is currently not available`; V2 also remains intermittent
-on parent argument serialization and tool-output continuation. Keep the external OpenCode Worker as
-production.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. Report possible exposure of credentials, task text, or raw responses through the private route in [SECURITY.md](SECURITY.md), not a public issue.
