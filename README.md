@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.12.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.13.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -15,6 +15,7 @@ It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, Ope
 
 - Routes automatic work to the currently qualified/healthy Provider first and uses the other SenseNova route as bounded fallback. The checked-in order is currently `sensenova -> sensenova1` because the latest explicit smoke showed `sensenova` healthy while `sensenova1` returned upstream stream errors. Re-run explicit smoke before changing this order.
 - Requires real tool activity, a healthy terminal stream, a strict five-field JSON result, and a matching workspace diff before accepting a result.
+- When a no-side-effect OpenCode stream has real tool activity but omits its final JSON, the relay may use a short, same-session, no-tool contract-recovery request before ordinary retry/fallback. It never replays the task or continues a changed workspace.
 - Retries a stream failure once, then uses bounded Provider fallback only when the workspace is unchanged.
 - Stops on a partial write rather than replaying the task with another Provider.
 - Keeps native Codex Agent Team integrations canary-only.
@@ -159,7 +160,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.12 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.13 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
@@ -206,7 +207,7 @@ deepseek-worker --json smoke-test --provider sensenova --workdir /path/to/repo
 deepseek-worker --json stats --hours 8
 ```
 
-`run` invokes OpenCode directly with the configured third-party model IDs. Read-heavy roles use OpenCode's `plan` agent; implementation roles use its `build` agent. Production runs do not change Codex App root Provider or create Codex task threads.
+`run` invokes OpenCode directly with the configured third-party model IDs. Read-heavy roles use OpenCode's `plan` agent; implementation roles use its `build` agent. Production runs do not change Codex App root Provider or create Codex task threads. A short same-session finalization recovery can be used only after a no-side-effect failed stream with confirmed task activity; the opaque session ID is held only in memory and is not written to job artifacts or aggregate telemetry.
 
 `catalog-build`, `native-check`, `native-v1-canary`, and `cliproxy-native-canary` are experimental diagnostics. Native V1/V2 results do not establish production route reliability. See [Configuration](docs/CONFIGURATION.md) and [Release Testing](docs/RELEASE_TESTING.md).
 

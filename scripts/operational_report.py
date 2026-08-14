@@ -70,7 +70,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     statuses: dict[str, int] = defaultdict(int)
     attempt_failure_categories: dict[str, int] = defaultdict(int)
     durations: list[float] = []
-    success = fallback = partial = retried = blocked = accepted_usage_rows = 0
+    success = fallback = partial = retried = finalization_recovered = blocked = accepted_usage_rows = 0
     for row in rows:
         status = str(row.get("status") or "unknown")
         statuses[status] += 1
@@ -79,6 +79,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         fallback += int(bool(row.get("fallback_used")))
         partial += int(bool(row.get("partial_write")))
         retried += int(int(row.get("stream_retry_count") or 0) > 0)
+        finalization_recovered += int(int(row.get("finalization_recovery_count") or 0) > 0)
         accepted_usage_rows += int("accepted_usage" in row)
         categories = row.get("attempt_failure_categories")
         if isinstance(categories, list):
@@ -99,6 +100,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "fallback_runs": fallback,
         "partial_write_runs": partial,
         "stream_retry_runs": retried,
+        "finalization_recovery_runs": finalization_recovered,
         "blocked_runs": blocked,
         "attempt_failure_category_counts": dict(sorted(attempt_failure_categories.items())),
         "usage": {

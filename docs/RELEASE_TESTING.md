@@ -41,7 +41,7 @@ The release gate is a deterministic stress test of relay behavior, not a claim a
 
 | Scenario | Test shape | Required result |
 | --- | --- | --- |
-| Stream faults | malformed, guessed, no-tool, error, missing-finish, and length-truncated streams | no invalid result accepted |
+| Stream faults | malformed, guessed, no-tool, error, missing-finish, length-truncated streams, and same-session finalization recovery | no invalid result accepted; recovery never replays a task or continues after a workspace change |
 | Fallback | 32 repeated invalid-primary / valid-secondary sequences | bounded retry and only valid secondary acceptance |
 | Write contention | 12 simultaneous lock contenders for one workdir | exactly one owner, 11 blocked |
 | Job isolation | 24 concurrent `launch` operations | unique job IDs and private metadata/stdout/stderr paths |
@@ -123,7 +123,7 @@ For the required seven-day operational observation, generate a source-local UTC 
 each day and preserve only the redacted aggregate report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.12 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.13 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```

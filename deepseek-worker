@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -27,7 +28,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.12"
+VERSION = "0.10.13"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -140,6 +141,11 @@ DEFAULT_GENERAL_TIMEOUT = RUNTIME_CONFIG["timeouts"]["general_seconds"]
 
 CIRCUIT_FAILURE_THRESHOLD = 2
 CIRCUIT_TTL_SECONDS = 30
+FINALIZATION_RESERVE_SECONDS = 15
+FINALIZATION_PROMPT = (
+    "Do not make any changes and do not use tools. Return only the required final JSON object for "
+    "the task you just completed, with exactly status, summary, files_changed, tests, and risks."
+)
 
 
 def _circuit_lock():
@@ -577,6 +583,23 @@ def adapter_command(provider: str, workdir: Path, role: str, sandbox: str, task:
     ]
 
 
+def finalization_command(workdir: Path, session_id: str, sandbox: str) -> list[str]:
+    """Request the original OpenCode session's contract without replaying its task."""
+    return [
+        str(OPENCODE_PATH),
+        "run",
+        "--dir",
+        str(workdir),
+        "--session",
+        session_id,
+        "--agent",
+        "plan" if sandbox == "read-only" else "build",
+        "--format",
+        "json",
+        FINALIZATION_PROMPT,
+    ]
+
+
 STATUS_ALIASES = {
     "success": "success",
     "succeeded": "success",
@@ -718,6 +741,43 @@ def parse_opencode_events(stdout: str) -> tuple[dict[str, Any] | None, dict[str,
             usage["reasoning_output_tokens"] += int(tokens.get("reasoning") or 0)
     message = parse_result_text("\n".join(texts)) if texts else None
     return message, usage, bool(texts) and message is None, task_activity
+
+
+def opencode_session_id(stdout: str) -> str | None:
+    """Read one opaque OpenCode session identifier from raw events without retaining it."""
+    session_ids: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"sessionID", "sessionId", "session_id"} and isinstance(child, str):
+                    if re.fullmatch(r"[A-Za-z0-9_-]{8,200}", child):
+                        session_ids.add(child)
+                elif isinstance(child, (dict, list)):
+                    collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    for line in stdout.splitlines():
+        try:
+            collect(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return next(iter(session_ids)) if len(session_ids) == 1 else None
+
+
+def finalization_timeout(remaining_seconds: int) -> int:
+    """Use only time naturally left after an early stream terminal, never steal task runtime."""
+    return min(FINALIZATION_RESERVE_SECONDS, max(0, remaining_seconds))
+
+
+def combined_usage(*values: dict[str, int]) -> dict[str, int]:
+    combined: dict[str, int] = {}
+    for value in values:
+        for key, amount in value.items():
+            combined[key] = combined.get(key, 0) + int(amount)
+    return combined
 
 
 def opencode_stream_diagnostics(stdout: str) -> dict[str, Any]:
@@ -1321,6 +1381,7 @@ def record_run(
         "duration_seconds": payload.get("duration_seconds"),
         "stream_finish_reason": payload.get("stream_finish_reason"),
         "stream_retry_count": payload.get("stream_retry_count", 0),
+        "finalization_recovery_count": payload.get("finalization_recovery_count", 0),
         "fallback_used": "provider fallback was used after an earlier DeepSeek route failed" in risks,
         "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
         "attempt_failure_categories": list(payload.get("attempt_failure_categories") or []),
@@ -1948,6 +2009,7 @@ def _run_worker_locked(
     side_effect_attempt: dict[str, Any] | None = None
     accepted = False
     used_stream_retry = False
+    used_finalization_recovery = False
     last_stream = {"finish_reason": None, "failure": None}
     provider = selected_provider
     profile = PROVIDERS[provider]["profile"]
@@ -1980,10 +2042,45 @@ def _run_worker_locked(
                 message, usage, invalid_result, task_activity = parse_worker_events(completed.stdout)
                 stream = opencode_stream_diagnostics(completed.stdout)
                 last_stream = stream
-                for key, value in usage.items():
-                    total_usage[key] = total_usage.get(key, 0) + value
                 attempt_snapshot = workspace_snapshot(workdir)
                 attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
+                session_id = opencode_session_id(completed.stdout)
+                recovered_finalization = False
+                recovered_usage: dict[str, int] | None = None
+                finalization_used_tools = False
+                recovery_budget = finalization_timeout(int(provider_deadline - time.monotonic()))
+                if (
+                    completed.returncode == 0
+                    and message is None
+                    and task_activity
+                    and not attempt_changes
+                    and stream["failure"] is not None
+                    and session_id is not None
+                    and recovery_budget >= 5
+                ):
+                    try:
+                        recovery = invoke_codex(
+                            finalization_command(workdir, session_id, sandbox),
+                            workdir,
+                            recovery_budget,
+                            env={**os.environ, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "131072"},
+                        )
+                    except FileNotFoundError as exc:
+                        raise WorkerError("opencode command not found") from exc
+                    recovered_message, recovered_usage, recovered_invalid, recovered_activity = parse_worker_events(recovery.stdout)
+                    message = recovered_message
+                    usage = combined_usage(usage, recovered_usage)
+                    invalid_result = recovered_invalid
+                    finalization_used_tools = recovered_activity
+                    completed = recovery
+                    stream = opencode_stream_diagnostics(recovery.stdout)
+                    last_stream = stream
+                    attempt_snapshot = workspace_snapshot(workdir)
+                    attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
+                    recovered_finalization = True
+                    used_finalization_recovery = True
+                for key, value in usage.items():
+                    total_usage[key] = total_usage.get(key, 0) + value
                 current_snapshot = attempt_snapshot
                 declared_changes = set(message.get("files_changed", [])) if message is not None else set()
                 declared_mismatch = bool(message is not None and declared_changes != set(attempt_changes))
@@ -1991,16 +2088,19 @@ def _run_worker_locked(
                     completed.returncode == 0
                     and message is not None
                     and task_activity
+                    and not finalization_used_tools
                     and not declared_mismatch
                     and stream["failure"] is None
                 ):
                     accepted = True
                     if message.get("status") == "success":
-                        accepted_usage = dict(usage)
+                        accepted_usage = dict(recovered_usage if recovered_usage is not None else usage)
                     break
                 attempt_label = provider if stream_retry_count == 0 else f"{provider} retry"
-                category = attempt_failure_category(
-                    completed, stream, message, invalid_result, task_activity, declared_mismatch
+                category = (
+                    "finalization_used_tools"
+                    if finalization_used_tools
+                    else attempt_failure_category(completed, stream, message, invalid_result, task_activity, declared_mismatch)
                 )
                 attempts.append(
                     {
@@ -2009,6 +2109,8 @@ def _run_worker_locked(
                         "error": (
                             "declared files do not match the real workdir diff"
                             if declared_mismatch
+                            else "same-session finalization unexpectedly used a task tool"
+                            if finalization_used_tools
                             else str(stream["failure"])
                             if stream["failure"] is not None
                             else "invalid structured worker result"
@@ -2058,6 +2160,7 @@ def _run_worker_locked(
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "finalization_recovery_count": 1 if used_finalization_recovery else 0,
             "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
@@ -2076,6 +2179,7 @@ def _run_worker_locked(
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "finalization_recovery_count": 1 if used_finalization_recovery else 0,
             "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
@@ -2096,6 +2200,7 @@ def _run_worker_locked(
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "finalization_recovery_count": 1 if used_finalization_recovery else 0,
             "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }

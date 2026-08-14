@@ -97,6 +97,15 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(command[command.index("--agent") + 1], "plan")
         self.assertEqual(command[command.index("--model") + 1], "sensenova1/deepseek-v4-flash")
 
+    def test_finalization_command_reuses_session_and_preserves_role_sandbox(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            command = module.finalization_command(Path(temporary_dir), "session_abcdefgh", "read-only")
+        self.assertEqual(command[command.index("--session") + 1], "session_abcdefgh")
+        self.assertEqual(command[command.index("--agent") + 1], "plan")
+        self.assertIn("Do not make any changes", command[-1])
+        self.assertEqual(module.finalization_timeout(60), 15)
+        self.assertEqual(module.finalization_timeout(4), 4)
+
     def test_invoke_codex_closes_stdin(self):
         class DummyProcess:
             pid = 123
@@ -990,6 +999,68 @@ class RouterTests(unittest.TestCase):
         self.assertIn("bounded same-provider stream retry was used", payload["risks"])
         self.assertEqual(payload["stream_finish_reason"], "stop")
         self.assertEqual(payload["stream_retry_count"], 1)
+
+    def test_no_text_stream_recovers_contract_in_same_session_without_replaying_task(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop", "tokens": {"input": 10, "output": 3}}},
+        ]))
+        response = '{"status":"success","summary":"done","files_changed":[],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop", "tokens": {"input": 2, "output": 1}}},
+        ]))
+        results = [
+            module.subprocess.CompletedProcess([], 0, initial, ""),
+            module.subprocess.CompletedProcess([], 0, recovery, ""),
+        ]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="read-only", timeout=90, no_record=True)
+            with patch.object(module, "invoke_codex", side_effect=results) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(invoke.call_args_list[1].args[0][invoke.call_args_list[1].args[0].index("--session") + 1], "session_abcdefgh")
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["finalization_recovery_count"], 1)
+        self.assertEqual(payload["usage"], {"input_tokens": 12, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 4, "reasoning_output_tokens": 0})
+        self.assertEqual(payload["accepted_usage"], {"input_tokens": 2, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0})
+
+    def test_finalization_change_stays_partial_and_never_falls_back(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        snapshots = [{}, {}, {"README.md": "changed"}, {"README.md": "changed"}]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="edit README", task_file=None, role="documentation", workdir=workdir, provider="auto", sandbox="auto", timeout=90, no_record=True)
+            with patch.object(module, "workspace_snapshot", side_effect=snapshots), patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 0, initial, ""), module.subprocess.CompletedProcess([], 0, recovery, "")]) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["files_changed"], ["README.md"])
+        self.assertEqual(payload["finalization_recovery_count"], 1)
+
+    def test_finalization_tool_use_is_not_accepted_as_a_second_execution(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        response = '{"status":"success","summary":"done","files_changed":[],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="read-only", timeout=90, no_record=True)
+            with patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 0, initial, ""), module.subprocess.CompletedProcess([], 0, recovery, "")]):
+                payload = module.run_worker(args)
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("finalization_used_tools", payload["attempt_failure_categories"])
 
     def test_stream_failure_with_workspace_change_does_not_retry(self):
         truncated = "\n".join(map(json.dumps, [

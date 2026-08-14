@@ -45,6 +45,7 @@ def relay_summary(report: dict[str, Any]) -> dict[str, Any]:
         "success_rate_percent": number(overall.get("success_rate_percent")),
         "p95_duration_seconds": number(overall.get("p95_duration_seconds")),
         "partial_write_runs": number(overall.get("partial_write_runs")),
+        "finalization_recovery_runs": number(overall.get("finalization_recovery_runs")),
         "fallback_runs": number(overall.get("fallback_runs")),
         "accepted_request_tokens": number(accepted.get("request_tokens")),
         "accepted_context_tokens": number(accepted.get("context_tokens")),
@@ -66,6 +67,7 @@ def provider_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
             "p95_duration_seconds": number(detail.get("p95_duration_seconds")),
             "fallback_runs": number(detail.get("fallback_runs")),
             "partial_write_runs": number(detail.get("partial_write_runs")),
+            "finalization_recovery_runs": number(detail.get("finalization_recovery_runs")),
             "accepted_request_tokens": number(accepted.get("request_tokens")),
         })
     return rows
@@ -117,6 +119,7 @@ def build_artifact(relay_report: dict[str, Any], relay_path: Path, usage_report:
         {"id": "relay_success", "description": "Complete success rate for version-filtered Relay production runs.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "Relay success rate", "field": "success_rate_percent", "format": "number", "unit": "%"}]},
         {"id": "relay_latency", "description": "P95 end-to-end Relay duration in seconds.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "P95 latency", "field": "p95_duration_seconds", "format": "number", "unit": "s"}]},
         {"id": "relay_partial", "description": "Partial writes require manual review and never auto-retry.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "Partial writes", "field": "partial_write_runs", "format": "number"}]},
+        {"id": "relay_finalization", "description": "No-tool same-session attempts used to recover a missing final contract.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "Finalization recovery", "field": "finalization_recovery_runs", "format": "number"}]},
         {"id": "relay_effective_tokens", "description": "Relay-local successful final-attempt request tokens only; excludes errors, partials, and retries.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "Effective Relay tokens", "field": "accepted_request_tokens", "format": "number"}]},
     ]
     blocks: list[dict[str, Any]] = [
@@ -132,6 +135,7 @@ def build_artifact(relay_report: dict[str, Any], relay_path: Path, usage_report:
             {"field": "p95_duration_seconds", "label": "P95 seconds", "format": "number"},
             {"field": "fallback_runs", "label": "Fallback", "format": "number"},
             {"field": "partial_write_runs", "label": "Partial writes", "format": "number"},
+            {"field": "finalization_recovery_runs", "label": "Finalization recovery", "format": "number"},
             {"field": "accepted_request_tokens", "label": "Effective Relay tokens", "format": "number"},
         ],
     }]
@@ -182,6 +186,7 @@ def render_html(artifact: dict[str, Any]) -> str:
         ("Relay success rate", f"{display(summary['success_rate_percent'])}%", "Complete production runs"),
         ("P95 latency", f"{display(summary['p95_duration_seconds'])} s", "End-to-end Relay duration"),
         ("Partial writes", display(summary["partial_write_runs"]), "Require manual diff review"),
+        ("Finalization recovery", display(summary["finalization_recovery_runs"]), "Same session, no tools"),
         ("Effective Relay tokens", display(summary["accepted_request_tokens"]), "Final success attempts only"),
     ]
     card_html = "".join(
@@ -189,7 +194,7 @@ def render_html(artifact: dict[str, Any]) -> str:
         for label, value, note in cards
     )
     provider = table_html(
-        [("provider", "Provider"), ("runs", "Runs"), ("success_rate_percent", "Success rate %"), ("p95_duration_seconds", "P95 seconds"), ("fallback_runs", "Fallback"), ("partial_write_runs", "Partial writes"), ("accepted_request_tokens", "Effective Relay tokens")],
+        [("provider", "Provider"), ("runs", "Runs"), ("success_rate_percent", "Success rate %"), ("p95_duration_seconds", "P95 seconds"), ("fallback_runs", "Fallback"), ("partial_write_runs", "Partial writes"), ("finalization_recovery_runs", "Finalization recovery"), ("accepted_request_tokens", "Effective Relay tokens")],
         datasets["provider_health"],
     )
     usage_section = ""

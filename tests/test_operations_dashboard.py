@@ -17,13 +17,14 @@ class OperationsDashboardTests(unittest.TestCase):
         relay = {
             "source": "relay_operational_telemetry",
             "utc_window": {"start": "2026-08-13T00:00:00Z", "end": "2026-08-13T01:00:00Z"},
-            "overall": {"runs": 10, "successes": 9, "success_rate_percent": 90, "p95_duration_seconds": 30, "partial_write_runs": 1, "fallback_runs": 2, "usage": {"accepted_success_usage": {"request_tokens": 100, "context_tokens": 120}}},
-            "providers": {"sensenova": {"runs": 10, "success_rate_percent": 90, "p95_duration_seconds": 30, "fallback_runs": 2, "partial_write_runs": 1, "usage": {"accepted_success_usage": {"request_tokens": 100}}}},
+            "overall": {"runs": 10, "successes": 9, "success_rate_percent": 90, "p95_duration_seconds": 30, "partial_write_runs": 1, "finalization_recovery_runs": 2, "fallback_runs": 2, "usage": {"accepted_success_usage": {"request_tokens": 100, "context_tokens": 120}}},
+            "providers": {"sensenova": {"runs": 10, "success_rate_percent": 90, "p95_duration_seconds": 30, "fallback_runs": 2, "partial_write_runs": 1, "finalization_recovery_runs": 2, "usage": {"accepted_success_usage": {"request_tokens": 100}}}},
         }
         artifact = module.build_artifact(relay, Path("reports/relay.json"), None, None)
         self.assertEqual(artifact["surface"], "dashboard")
         self.assertEqual(artifact["snapshot"]["status"], "partial")
         self.assertEqual(artifact["snapshot"]["datasets"]["provider_health"][0]["accepted_request_tokens"], 100)
+        self.assertEqual(artifact["snapshot"]["datasets"]["relay_summary"][0]["finalization_recovery_runs"], 2)
         self.assertIn("must not be added", artifact["package_info"]["ledger_boundary"])
 
     def test_adds_usage_table_without_cross_ledger_total(self):
