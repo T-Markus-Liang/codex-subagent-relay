@@ -62,8 +62,8 @@ That command consumes Provider quota. Delete the disposable directory when finis
 
 ## Native Research Boundary
 
-The external Relay is the production executor. `native-v1-canary`, `native-role-bisection`, and
-`cliproxy-native-canary` are isolated diagnostics only. They create a temporary `CODEX_HOME` and
+The external Relay is the production executor. `native-v1-canary`, `native-v1-tool-canary`,
+`native-role-bisection`, and `cliproxy-native-canary` are isolated diagnostics only. They create a temporary `CODEX_HOME` and
 must leave the root `model_provider`, conversation database, and rollout history unchanged.
 
 `native-role-bisection` starts with a built-in role, then adds only one role layer at a time. A
@@ -80,6 +80,10 @@ Codex configuration or disable plugins for normal Relay MCP use.
 
 The V1 parent prompt explicitly calls the namespaced `wait_agent` tool after `spawn_agent`; a
 plain-language request to wait is not enough to prove parent-side result delivery.
+
+`native-v1-tool-canary` additionally places two random hidden values in its disposable workspace.
+The child must read both with parallel shell calls, return their exact values through `wait_agent`,
+and leave matching tool, rollout, bridge, and child-metadata evidence. It is still canary-only.
 
 ## Environment Variables
 

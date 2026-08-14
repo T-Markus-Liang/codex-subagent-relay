@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.15.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.16.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -164,7 +164,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.15 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.16 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
@@ -213,7 +213,7 @@ deepseek-worker --json stats --hours 8
 
 `run` invokes OpenCode directly with the configured third-party model IDs. Read-heavy roles use OpenCode's `plan` agent; implementation roles use its `build` agent. Production runs do not change Codex App root Provider or create Codex task threads. A short same-session finalization recovery can be used only after a no-side-effect failed stream with confirmed task activity; the opaque session ID is held only in memory and is not written to job artifacts or aggregate telemetry.
 
-`catalog-build`, `native-check`, `native-v1-canary`, and `cliproxy-native-canary` are experimental diagnostics. Native V1/V2 results do not establish production route reliability. See [Configuration](docs/CONFIGURATION.md) and [Release Testing](docs/RELEASE_TESTING.md).
+`catalog-build`, `native-check`, `native-v1-canary`, `native-v1-tool-canary`, and `cliproxy-native-canary` are experimental diagnostics. `native-v1-tool-canary` is an isolated no-write challenge: it requires the child to make two parallel shell calls for hidden files, return the exact contract through V1 `wait_agent`, and leave evidence in the isolated rollout and state database. Native V1/V2 results do not establish production route reliability. See [Configuration](docs/CONFIGURATION.md) and [Release Testing](docs/RELEASE_TESTING.md).
 
 ## Codex Plugin And MCP
 

@@ -874,6 +874,28 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(waited)
         self.assertFalse(verified)
 
+    def test_native_v1_result_accepts_explicit_tool_canary_summary(self):
+        nonce = "abc123"
+        summary = "native-v1-tool-canary:token-a:token-b"
+        contract = {"status": "success", "summary": summary, "files_changed": [], "tests": [], "risks": []}
+        event = {"type": "item.completed", "item": {"type": "collab_tool_call", "tool": "wait", "status": "completed", "agents_states": {"child": {"message": contract}}}}
+        result, child_id, spawned, waited, verified = module.native_v1_child_result(json.dumps(event), nonce, summary)
+        self.assertEqual(result, contract)
+        self.assertEqual(child_id, "child")
+        self.assertTrue(spawned)
+        self.assertTrue(waited)
+        self.assertTrue(verified)
+
+    def test_native_v1_result_rejects_wrong_explicit_tool_canary_summary(self):
+        nonce = "abc123"
+        contract = {"status": "success", "summary": "native-v1-tool-canary:wrong", "files_changed": [], "tests": [], "risks": []}
+        event = {"type": "item.completed", "item": {"type": "collab_tool_call", "tool": "wait", "status": "completed", "agents_states": {"child": {"message": contract}}}}
+        _result, _child_id, _spawned, waited, verified = module.native_v1_child_result(
+            json.dumps(event), nonce, "native-v1-tool-canary:expected-a:expected-b"
+        )
+        self.assertTrue(waited)
+        self.assertFalse(verified)
+
     def test_native_result_recovers_child_id_from_v2_wait_state(self):
         nonce = "v2nonce"
         contract = {"status": "success", "summary": f"native-v1-canary:{nonce}", "files_changed": [], "tests": [], "risks": []}

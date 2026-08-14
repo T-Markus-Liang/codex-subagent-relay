@@ -26,6 +26,7 @@ It must pass completely. It verifies:
 - Run metadata excludes task text and secret-like result content.
 - Real workspace changes stop automatic retry and Provider fallback.
 - Native canaries remain evidence-only and must never promote a production route automatically.
+- The V1 tool canary requires hidden-token shell tool activity, parallel-call evidence, a direct `wait_agent` child result, Provider bridge completion, and isolated child metadata. It is diagnostic evidence only and does not count toward the external Worker SLO.
 - The bundled plugin manifest, repository marketplace entry, executable MCP launcher, and MCP
   initialize/tools-list handshake are validated by the release gate.
 - Automatic routing and native canary telemetry are separate: compare `by_run_type.external_run` with
@@ -123,7 +124,7 @@ For the required seven-day operational observation, generate a source-local UTC 
 each day and preserve only the redacted aggregate report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.15 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.16 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```

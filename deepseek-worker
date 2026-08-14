@@ -28,7 +28,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.15"
+VERSION = "0.10.16"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1038,7 +1038,11 @@ def build_cliproxy_canary_catalog(source: Path, output: Path, parent_model: str)
     os.chmod(output, 0o600)
 
 
-def native_v1_child_result(stdout: str, nonce: str) -> tuple[dict[str, Any] | None, str | None, bool, bool, bool]:
+def native_v1_child_result(
+    stdout: str,
+    nonce: str,
+    expected_summary: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None, bool, bool, bool]:
     spawned = waited = False
     child_result: dict[str, Any] | None = None
     child_ids: list[str] = []
@@ -1078,7 +1082,11 @@ def native_v1_child_result(stdout: str, nonce: str) -> tuple[dict[str, Any] | No
                 continue
             if is_valid_result(parsed):
                 child_result = parsed
-    expected_summaries = {f"native-v1-canary:{nonce}", f"cliproxy-native-canary:{nonce}"}
+    expected_summaries = (
+        {expected_summary}
+        if expected_summary is not None
+        else {f"native-v1-canary:{nonce}", f"cliproxy-native-canary:{nonce}"}
+    )
     nonce_verified = bool(child_result and child_result.get("summary") in expected_summaries)
     child_id = child_ids[0] if len(child_ids) == 1 else None
     spawned = spawned or bool(waited and child_id)
@@ -2539,6 +2547,168 @@ def native_v1_canary(
     }
 
 
+def native_v1_tool_canary(
+    provider: str,
+    workdir: Path,
+    timeout: int,
+    parent_model_override: str | None = None,
+    role_layer: str = "full",
+) -> dict[str, Any]:
+    """Prove isolated V1 tool use and parent result transport; never promote production routing."""
+    agent_for_provider = {"sensenova": "explorer", "sensenova1": "worker", "opencode-go": "default"}
+    agent_type = agent_for_provider.get(provider)
+    if agent_type is None:
+        raise WorkerError(f"unsupported native tool canary provider: {provider}")
+    if role_layer not in NATIVE_ROLE_LAYERS:
+        raise WorkerError(f"unsupported native role layer: {role_layer}")
+    try:
+        with CONFIG_PATH.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkerError(f"cannot read Codex config: {type(exc).__name__}") from exc
+    root_provider = str(config.get("model_provider", ""))
+    parent_model = parent_model_override or str(config.get("model", ""))
+    if root_provider != "openai-chatgpt":
+        raise WorkerError("native tool canary requires root model_provider=openai-chatgpt")
+    if not parent_model:
+        raise WorkerError("native tool canary requires a configured parent model")
+    catalog_source = Path(str(config.get("model_catalog_json", DEFAULT_CATALOG_PATH))).expanduser().resolve()
+    codex = desktop_codex_binary()
+    version_result = subprocess.run([str(codex), "--version"], text=True, capture_output=True, timeout=10, check=False)
+    desktop_version = version_result.stdout.strip() if version_result.returncode == 0 else "unknown"
+    nonce = secrets.token_hex(16)
+    config_before = file_fingerprint(CONFIG_PATH)
+    state_before = state_db_snapshot()
+    log_offset = BRIDGE_LOG_PATH.stat().st_size if BRIDGE_LOG_PATH.is_file() else 0
+    with tempfile.TemporaryDirectory(prefix="deepseek-native-v1-tool-") as temporary_dir:
+        temporary_root = Path(temporary_dir)
+        isolated_home = temporary_root / "codex-home"
+        isolated_agents = isolated_home / "agents"
+        isolated_workspace = temporary_root / "workspace"
+        isolated_agents.mkdir(parents=True)
+        isolated_workspace.mkdir()
+        hidden_a = secrets.token_hex(16)
+        hidden_b = secrets.token_hex(16)
+        (isolated_workspace / ".native-v1-canary-a").write_text(hidden_a, encoding="utf-8")
+        (isolated_workspace / ".native-v1-canary-b").write_text(hidden_b, encoding="utf-8")
+        expected_summary = f"native-v1-tool-canary:{hidden_a}:{hidden_b}"
+        child_contract_template = {
+            "status": "success",
+            "summary": "native-v1-tool-canary:<content-a>:<content-b>",
+            "files_changed": [],
+            "tests": ["parallel hidden tokens verified"],
+            "risks": [],
+        }
+        child_task = (
+            f"This is read-only native V1 tool canary run {nonce}. Two files named .native-v1-canary-a and "
+            ".native-v1-canary-b exist in your current working directory, but their contents are not in this task. "
+            "Use the shell tool to read them with exactly two independent commands in one parallel tool-use turn. "
+            "Do not modify files. Return exactly this JSON object with no Markdown or surrounding prose after "
+            "replacing the summary placeholders with both exact file contents: "
+            + json.dumps(child_contract_template, separators=(",", ":"))
+        )
+        prompt = native_v1_prompt(agent_type, child_task)
+        write_native_canary_config(CONFIG_PATH, isolated_home / "config.toml", provider)
+        role_source = CODEX_HOME / "agents" / f"{agent_type}.toml"
+        custom_role = write_native_role_layer(isolated_agents / role_source.name, agent_type, provider, role_layer, role_source)
+        for auth_name in ("auth.json", "current_account"):
+            auth_source = CODEX_HOME / auth_name
+            if auth_source.is_file():
+                (isolated_home / auth_name).symlink_to(auth_source)
+        catalog = temporary_root / "models.json"
+        build_v1_canary_catalog(catalog_source, catalog, parent_model)
+        command = native_v1_command(codex, catalog, parent_model, prompt)
+        isolated_env = dict(os.environ)
+        isolated_env["CODEX_HOME"] = str(isolated_home)
+        completed = invoke_codex(command, isolated_workspace, timeout, env=isolated_env)
+        child_result, child_id, spawned, waited, nonce_verified = native_v1_child_result(
+            completed.stdout,
+            nonce,
+            expected_summary,
+        )
+        child_metadata = native_child_metadata(isolated_home, child_id)
+        rollout_evidence = child_rollout_evidence(
+            isolated_home,
+            child_id,
+            nonce,
+            expected_summary=expected_summary,
+            expected_outputs=(hidden_a, hidden_b),
+        )
+        isolated_state_created = any(isolated_home.glob("state_*.sqlite"))
+    provider_completed = bridge_provider_completed(BRIDGE_LOG_PATH, log_offset, provider)
+    diagnostics = native_event_diagnostics(completed.stdout)
+    config_unchanged = config_before == file_fingerprint(CONFIG_PATH)
+    state_db_unchanged = state_before == state_db_snapshot()
+    metadata_valid = bool(
+        child_metadata
+        and child_metadata.get("model_provider") == provider
+        and child_metadata.get("model") == "deepseek-v4-flash"
+        and str(child_metadata.get("agent_role", "")).lower() == agent_type.lower()
+    )
+    errors: list[str] = []
+    warnings: list[str] = []
+    combined_output = completed.stdout + "\n" + completed.stderr
+    if completed.returncode != 0:
+        errors.append(redact(completed.stderr or completed.stdout, 300))
+    if "Unknown model" in combined_output:
+        errors.append("unknown model")
+    if not spawned:
+        errors.append("native V1 spawn event not completed")
+    if not waited:
+        errors.append("native V1 wait event not completed")
+    if child_result is None or not nonce_verified:
+        errors.append("wait event did not contain the assigned direct child result contract")
+    if not rollout_evidence["task_payload_present"]:
+        errors.append("child rollout did not contain the assigned task nonce")
+    if not rollout_evidence["tool_calls"] or rollout_evidence["tool_outputs"] < 2:
+        errors.append("child rollout did not contain both completed shell tool exchanges")
+    if not rollout_evidence["parallel_tool_calls_observed"]:
+        errors.append("child rollout did not show parallel shell tool calls")
+    if not rollout_evidence["expected_outputs_verified"]:
+        errors.append("child shell outputs did not contain both hidden challenge tokens")
+    if not rollout_evidence["final_result_valid"] or not rollout_evidence["final_result_nonce_verified"]:
+        errors.append("child rollout did not contain the assigned final result contract")
+    if not provider_completed:
+        errors.append(f"bridge did not record completion for {provider}")
+    if not metadata_valid:
+        errors.append("isolated state DB did not confirm the expected child provider/model/role")
+    if not isolated_state_created:
+        errors.append("native V1 tool canary did not create an isolated state DB")
+    if not config_unchanged:
+        errors.append("Codex config changed during canary")
+    if not state_db_unchanged:
+        warnings.append("live Codex state DB changed concurrently; canary child state was confined to temporary CODEX_HOME")
+    return {
+        "status": "success" if completed.returncode == 0 and not errors else "blocked",
+        "protocol": "v1-tool",
+        "desktop_codex_version": desktop_version,
+        "root_model_provider": root_provider,
+        "parent_model": parent_model,
+        "agent_type": agent_type,
+        "role_layer": role_layer,
+        "custom_role": custom_role,
+        "expected_provider": provider,
+        "spawned": spawned,
+        "waited": waited,
+        "child_result_valid": child_result is not None,
+        "nonce_verified": nonce_verified,
+        "task_payload_present": rollout_evidence["task_payload_present"],
+        "tool_calls": rollout_evidence["tool_calls"],
+        "tool_outputs": rollout_evidence["tool_outputs"],
+        "hidden_outputs_verified": rollout_evidence["expected_outputs_verified"],
+        "parallel_tool_calls_observed": rollout_evidence["parallel_tool_calls_observed"],
+        "rollout_final_result_valid": rollout_evidence["final_result_valid"],
+        "provider_completed": provider_completed,
+        "child_metadata_valid": metadata_valid,
+        "state_db_isolated": isolated_state_created,
+        "config_unchanged": config_unchanged,
+        "state_db_unchanged": state_db_unchanged,
+        "errors": errors,
+        "warnings": warnings,
+        "diagnostics": diagnostics,
+    }
+
+
 def native_role_bisection(provider: str, workdir: Path, timeout: int, parent_model_override: str | None = None) -> dict[str, Any]:
     """Run explicit isolated role layers in order; this is research, never production routing."""
     results: list[dict[str, Any]] = []
@@ -2973,6 +3143,16 @@ def parser() -> argparse.ArgumentParser:
     native_v1_parser.add_argument("--timeout", type=int, default=180)
     native_v1_parser.add_argument("--role-layer", choices=NATIVE_ROLE_LAYERS, default="full", help="Use one isolated role-definition layer; production remains external.")
 
+    native_v1_tool_parser = commands.add_parser(
+        "native-v1-tool-canary",
+        help="Run an isolated Desktop V1 canary that requires child shell tools, direct wait, and rollout evidence.",
+    )
+    native_v1_tool_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
+    native_v1_tool_parser.add_argument("--parent-model", help="Override the configured GPT parent for this isolated canary only.")
+    native_v1_tool_parser.add_argument("--workdir", default=str(Path.cwd()))
+    native_v1_tool_parser.add_argument("--timeout", type=int, default=180)
+    native_v1_tool_parser.add_argument("--role-layer", choices=NATIVE_ROLE_LAYERS, default="full", help="Use one isolated role-definition layer; production remains external.")
+
     native_bisection_parser = commands.add_parser(
         "native-role-bisection",
         help="Explicitly bisect built-in, minimal, model-only, Provider-only, and full V1 role layers in disposable CODEX_HOME instances.",
@@ -3082,6 +3262,12 @@ def main() -> int:
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = native_v1_canary(args.provider, workdir, args.timeout, args.parent_model, args.role_layer)
             record_run(payload, run_type="native_v1_canary", telemetry_scope="diagnostic")
+        elif args.command == "native-v1-tool-canary":
+            workdir = Path(args.workdir).expanduser().resolve()
+            if not workdir.is_dir():
+                raise WorkerError(f"workdir not found: {workdir}")
+            payload = native_v1_tool_canary(args.provider, workdir, args.timeout, args.parent_model, args.role_layer)
+            record_run(payload, run_type="native_v1_tool_canary", telemetry_scope="diagnostic")
         elif args.command == "native-role-bisection":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
