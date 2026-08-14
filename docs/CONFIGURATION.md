@@ -73,6 +73,11 @@ success: the gate also requires an actual parent wait, direct child JSON with it
 bridge completion, and isolated child Provider/model/role metadata. Do not use native routing for
 production until its separate qualification gate passes.
 
+Native V1 canaries set `features.plugins=false` and `features.remote_plugin=false` on their
+temporary CLI invocation. Plugin discovery and plugin manifests are unrelated to Agent Team
+delivery and may fail independently of the parent/child protocol. This does not modify the live
+Codex configuration or disable plugins for normal Relay MCP use.
+
 ## Environment Variables
 
 | Variable | Purpose | Default |

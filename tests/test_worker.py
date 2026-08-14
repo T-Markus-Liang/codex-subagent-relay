@@ -916,6 +916,8 @@ class RouterTests(unittest.TestCase):
         self.assertIn('model_provider="openai-chatgpt"', command)
         self.assertIn("features.multi_agent=true", command)
         self.assertIn("features.multi_agent_v2=false", command)
+        self.assertIn("features.remote_plugin=false", command)
+        self.assertIn("features.plugins=false", command)
         self.assertEqual(command[0], "/desktop/codex")
 
     def test_invalid_result_uses_next_auto_provider(self):

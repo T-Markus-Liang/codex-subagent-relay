@@ -28,7 +28,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.13"
+VERSION = "0.10.14"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1308,6 +1308,10 @@ def native_v1_command(codex: Path, catalog: Path, parent_model: str, prompt: str
         "features.multi_agent=true",
         "-c",
         "features.multi_agent_v2=false",
+        "-c",
+        "features.remote_plugin=false",
+        "-c",
+        "features.plugins=false",
         "exec",
         "--skip-git-repo-check",
         "--sandbox",
