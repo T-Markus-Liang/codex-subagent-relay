@@ -28,7 +28,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.16"
+VERSION = "0.10.17"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1398,8 +1398,8 @@ def record_run(
         "run_type": run_type,
         "telemetry_scope": telemetry_scope,
         "status": payload.get("status"),
-        "provider": payload.get("provider") or "unknown",
-        "role": payload.get("role") or "unknown",
+        "provider": payload.get("provider") or payload.get("expected_provider") or "unknown",
+        "role": payload.get("role") or payload.get("agent_type") or "unknown",
         "duration_seconds": payload.get("duration_seconds"),
         "stream_finish_reason": payload.get("stream_finish_reason"),
         "stream_retry_count": payload.get("stream_retry_count", 0),

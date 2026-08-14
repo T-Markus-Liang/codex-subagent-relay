@@ -590,6 +590,20 @@ class RouterTests(unittest.TestCase):
         self.assertIn("unknown", payload["role_stats"])
         self.assertEqual(len(payload["coverage_warnings"]), 1)
 
+    def test_record_run_attributes_native_diagnostics_from_expected_fields(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            log = Path(temporary_dir) / "runs.jsonl"
+            with patch.object(module, "RUN_LOG_PATH", log):
+                module.record_run(
+                    {"status": "blocked", "expected_provider": "sensenova", "agent_type": "explorer"},
+                    run_type="native_v1_tool_canary",
+                    telemetry_scope="diagnostic",
+                )
+            record = json.loads(log.read_text(encoding="utf-8"))
+        self.assertEqual(record["provider"], "sensenova")
+        self.assertEqual(record["role"], "explorer")
+        self.assertEqual(record["telemetry_scope"], "diagnostic")
+
     def test_catalog_default_is_not_global_config(self):
         self.assertNotEqual(module.DEFAULT_CATALOG_PATH, module.CONFIG_PATH)
 

@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.16.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.17.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -164,7 +164,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.16 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.17 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
