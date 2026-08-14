@@ -28,9 +28,10 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 from relay_runtime.opencode_adapter import AdapterConfigError, finalization_command as build_finalization_command, task_command
 from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runtime_config as load_policy, provider_order, resolve_route, timeout_split
+from relay_runtime.telemetry import append_record, run_record
 
 
-VERSION = "0.10.19"
+VERSION = "0.10.20"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1248,34 +1249,10 @@ def record_run(
     run_type: str = "external_run",
     telemetry_scope: str = "production",
 ) -> None:
-    if telemetry_scope not in {"production", "diagnostic", "qualification"}:
-        telemetry_scope = "diagnostic"
-    risks = payload.get("risks") or []
-    record = {
-        "timestamp": datetime.now(UTC).isoformat(),
-        "relay_version": VERSION,
-        "run_type": run_type,
-        "telemetry_scope": telemetry_scope,
-        "status": payload.get("status"),
-        "provider": payload.get("provider") or payload.get("expected_provider") or "unknown",
-        "role": payload.get("role") or payload.get("agent_type") or "unknown",
-        "duration_seconds": payload.get("duration_seconds"),
-        "stream_finish_reason": payload.get("stream_finish_reason"),
-        "stream_retry_count": payload.get("stream_retry_count", 0),
-        "finalization_recovery_count": payload.get("finalization_recovery_count", 0),
-        "fallback_used": "provider fallback was used after an earlier DeepSeek route failed" in risks,
-        "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
-        "attempt_failure_categories": list(payload.get("attempt_failure_categories") or []),
-        "usage": payload.get("usage", {}),
-        "accepted_usage": payload.get("accepted_usage", {}),
-    }
-    RUN_LOG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    fd = os.open(RUN_LOG_PATH, flags, 0o600)
-    try:
-        os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode())
-    finally:
-        os.close(fd)
+    append_record(
+        RUN_LOG_PATH,
+        run_record(payload, VERSION, run_type, telemetry_scope, datetime.now(UTC).isoformat()),
+    )
 
 
 def job_paths(job_id: str) -> tuple[Path, Path, Path]:

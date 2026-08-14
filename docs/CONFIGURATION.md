@@ -14,6 +14,8 @@ Provider/role/timeout policy, resolves a role to a route, and computes bounded f
 It cannot spawn OpenCode, inspect a task workspace, access job artifacts, or read credentials.
 `relay_runtime/opencode_adapter.py` only turns the already-validated Provider model ID into a fixed
 OpenCode command; it does not execute the command or accept arbitrary arguments.
+`relay_runtime/telemetry.py` receives only aggregate status, usage, and bounded failure-category
+fields for append-only operational records; it does not receive task text or raw model output.
 
 For a local policy experiment, set `DEEPSEEK_WORKER_CONFIG=/absolute/path/to/relay.toml` for the
 single command and run `doctor` first. Do not point a shared production installation at an
