@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.18.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.19.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -57,10 +57,11 @@ terminate the currently executing provider process before the terminal state is 
 ## Runtime Boundaries
 
 `relay_runtime/routing.py` owns pure secret-free policy validation, role classification, Provider
-ordering, and timeout allocation. `relay_runtime/job_store.py` owns durable job artifacts. The CLI
-owns process execution and compatibility commands; the MCP plugin remains a typed facade over the
-installed CLI. This separation prevents a policy test from spawning a Provider process and keeps
-Provider credentials outside the repository.
+ordering, and timeout allocation. `relay_runtime/opencode_adapter.py` builds only the reviewed,
+fixed-shape OpenCode commands from that policy. `relay_runtime/job_store.py` owns durable job
+artifacts. The CLI owns process execution and compatibility commands; the MCP plugin remains a
+typed facade over the installed CLI. This separation prevents a policy test from spawning a Provider
+process and keeps Provider credentials outside the repository.
 
 ## Requirements
 
@@ -172,7 +173,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.18 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.19 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```

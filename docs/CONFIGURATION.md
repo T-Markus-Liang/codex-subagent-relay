@@ -12,6 +12,8 @@ text. The runtime validates this file before it accepts commands.
 `relay_runtime/routing.py` is the pure policy layer for this file: it validates the declared
 Provider/role/timeout policy, resolves a role to a route, and computes bounded fallback timing.
 It cannot spawn OpenCode, inspect a task workspace, access job artifacts, or read credentials.
+`relay_runtime/opencode_adapter.py` only turns the already-validated Provider model ID into a fixed
+OpenCode command; it does not execute the command or accept arbitrary arguments.
 
 For a local policy experiment, set `DEEPSEEK_WORKER_CONFIG=/absolute/path/to/relay.toml` for the
 single command and run `doctor` first. Do not point a shared production installation at an

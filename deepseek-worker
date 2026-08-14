@@ -26,10 +26,11 @@ from pathlib import Path
 from typing import Any
 
 from relay_runtime.job_store import JobStore
+from relay_runtime.opencode_adapter import AdapterConfigError, finalization_command as build_finalization_command, task_command
 from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runtime_config as load_policy, provider_order, resolve_route, timeout_split
 
 
-VERSION = "0.10.18"
+VERSION = "0.10.19"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -447,43 +448,15 @@ Task:
 
 def adapter_command(provider: str, workdir: Path, role: str, sandbox: str, task: str) -> list[str]:
     """Build a bounded adapter invocation from the reviewed declarative Provider policy."""
-    metadata = PROVIDERS.get(provider)
-    if metadata is None:
-        raise WorkerError(f"unknown provider: {provider}")
-    if metadata.get("adapter") != "opencode":
-        raise WorkerError(f"unsupported provider adapter: {metadata.get('adapter')}")
-    return [
-        str(OPENCODE_PATH),
-        "run",
-        "--dir",
-        str(workdir),
-        "--agent",
-        "plan" if sandbox == "read-only" else "build",
-        "--model",
-        str(metadata["model"]),
-        "--format",
-        "json",
-        "--title",
-        f"deepseek-worker:{role}",
-        worker_prompt(task, role),
-    ]
+    try:
+        return task_command(OPENCODE_PATH, PROVIDERS.get(provider), workdir, role, sandbox, worker_prompt(task, role))
+    except AdapterConfigError as exc:
+        raise WorkerError(f"unknown provider: {provider}" if str(exc) == "unknown provider" else str(exc)) from exc
 
 
 def finalization_command(workdir: Path, session_id: str, sandbox: str) -> list[str]:
     """Request the original OpenCode session's contract without replaying its task."""
-    return [
-        str(OPENCODE_PATH),
-        "run",
-        "--dir",
-        str(workdir),
-        "--session",
-        session_id,
-        "--agent",
-        "plan" if sandbox == "read-only" else "build",
-        "--format",
-        "json",
-        FINALIZATION_PROMPT,
-    ]
+    return build_finalization_command(OPENCODE_PATH, workdir, session_id, sandbox, FINALIZATION_PROMPT)
 
 
 STATUS_ALIASES = {
