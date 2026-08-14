@@ -26,9 +26,10 @@ from pathlib import Path
 from typing import Any
 
 from relay_runtime.job_store import JobStore
+from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runtime_config as load_policy, provider_order, resolve_route, timeout_split
 
 
-VERSION = "0.10.17"
+VERSION = "0.10.18"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -77,55 +78,11 @@ def job_store() -> JobStore:
 
 
 def load_runtime_config(path: Path = RUNTIME_CONFIG_PATH) -> dict[str, Any]:
-    """Load declarative routing without accepting credentials or arbitrary adapters."""
+    """Compatibility boundary that maps runtime-policy errors to the CLI error type."""
     try:
-        with path.open("rb") as handle:
-            config = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise WorkerError(f"invalid relay configuration: {type(exc).__name__}") from exc
-    if not isinstance(config, dict) or config.get("schema_version") != 1:
-        raise WorkerError("unsupported relay configuration schema")
-    providers = config.get("providers")
-    roles = config.get("roles")
-    timeouts = config.get("timeouts")
-    fallback = config.get("fallback")
-    if not all(isinstance(value, dict) for value in (providers, roles, timeouts, fallback)):
-        raise WorkerError("relay configuration has missing sections")
-    normalized_providers: dict[str, dict[str, Any]] = {}
-    for name, metadata in providers.items():
-        if not isinstance(name, str) or not isinstance(metadata, dict):
-            raise WorkerError("relay configuration has invalid provider")
-        if metadata.get("adapter") != "opencode" or not isinstance(metadata.get("profile"), str) or not isinstance(metadata.get("model"), str):
-            raise WorkerError("relay configuration has invalid provider adapter")
-        try:
-            port = int(metadata.get("port"))
-        except (TypeError, ValueError) as exc:
-            raise WorkerError("relay configuration has invalid provider port") from exc
-        if not 1 <= port <= 65535:
-            raise WorkerError("relay configuration has invalid provider port")
-        normalized_providers[name] = {**metadata, "port": port}
-    normalized_roles: dict[str, set[str]] = {}
-    for name in ("read_only", "worker", "sol", "terra"):
-        values = roles.get(name)
-        if not isinstance(values, list) or not values or not all(isinstance(value, str) and value for value in values):
-            raise WorkerError("relay configuration has invalid role policy")
-        normalized_roles[name] = set(values)
-    normalized_fallback: dict[str, tuple[str, ...]] = {}
-    for name in ("read_only", "worker", "general"):
-        values = fallback.get(name)
-        if not isinstance(values, list) or not values or any(value not in normalized_providers for value in values):
-            raise WorkerError("relay configuration has invalid fallback policy")
-        normalized_fallback[name] = tuple(values)
-    normalized_timeouts: dict[str, int] = {}
-    for name in ("read_only_seconds", "write_seconds", "general_seconds"):
-        try:
-            value = int(timeouts.get(name))
-        except (TypeError, ValueError) as exc:
-            raise WorkerError("relay configuration has invalid timeout") from exc
-        if value < 30:
-            raise WorkerError("relay configuration timeout must be at least 30 seconds")
-        normalized_timeouts[name] = value
-    return {"providers": normalized_providers, "roles": normalized_roles, "fallback": normalized_fallback, "timeouts": normalized_timeouts}
+        return load_policy(path)
+    except RuntimeConfigError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 RUNTIME_CONFIG = load_runtime_config()
@@ -328,57 +285,11 @@ def load_task(task: str | None, task_file: str | None) -> str:
 
 
 def normalize_role(role: str, task: str = "") -> str:
-    value = role.strip().lower().replace("_", "-")
-    if value != "auto":
-        return value
-    lowered = task.lower()
-    keyword_groups = [
-        (SOL_ROLES, ("architecture", "architect", "规划", "架构", "最终 review", "final review")),
-        (TERRA_ROLES, ("second opinion", "validation", "review", "复核", "验证", "审查")),
-        (READ_ONLY_ROLES, ("grep", "search", "explore", "日志分析", "代码搜索", "仓库探索")),
-        (WORKER_ROLES, ("implement", "test", "debug", "refactor", "document", "实现", "测试", "调试", "重构", "文档")),
-    ]
-    for roles, keywords in keyword_groups:
-        if any(word in lowered for word in keywords):
-            return sorted(roles)[0]
-    return "implementation"
+    return resolve_route(role, task, RUNTIME_CONFIG)["role"]
 
 
 def route(role: str, task: str = "") -> dict[str, Any]:
-    normalized = normalize_role(role, task)
-    if normalized in SOL_ROLES:
-        return {"target": "sol", "role": normalized, "reason": "architecture_or_final_decision"}
-    if normalized in TERRA_ROLES:
-        return {"target": "terra", "role": normalized, "reason": "review_or_validation"}
-    if normalized in READ_ONLY_ROLES:
-        provider = RUNTIME_CONFIG["fallback"]["read_only"][0]
-        return {
-            "target": "deepseek",
-            "role": normalized,
-            "provider": provider,
-            "profile": PROVIDERS[provider]["profile"],
-            "sandbox": "read-only",
-            "reason": "read_heavy_execution",
-        }
-    if normalized in WORKER_ROLES:
-        provider = RUNTIME_CONFIG["fallback"]["worker"][0]
-        return {
-            "target": "deepseek",
-            "role": normalized,
-            "provider": provider,
-            "profile": PROVIDERS[provider]["profile"],
-            "sandbox": "workspace-write",
-            "reason": "execution_task",
-        }
-    provider = RUNTIME_CONFIG["fallback"]["general"][0]
-    return {
-        "target": "deepseek",
-        "role": normalized,
-        "provider": provider,
-        "profile": PROVIDERS[provider]["profile"],
-        "sandbox": "workspace-write",
-        "reason": "general_execution",
-    }
+    return resolve_route(role, task, RUNTIME_CONFIG)
 
 
 def workspace_snapshot(workdir: Path) -> dict[str, str]:
@@ -486,42 +397,17 @@ def changed_workspace_paths(before: dict[str, str], after: dict[str, str]) -> li
 
 def build_provider_order(role: str, selected_provider: str, automatic: bool) -> list[str]:
     """Keep fallback traffic aligned with the task's read/write characteristics."""
-    if not automatic:
-        return [selected_provider]
-    normalized = normalize_role(role)
-    if normalized in READ_ONLY_ROLES:
-        preferred = RUNTIME_CONFIG["fallback"]["read_only"]
-    elif normalized in WORKER_ROLES:
-        preferred = RUNTIME_CONFIG["fallback"]["worker"]
-    else:
-        preferred = RUNTIME_CONFIG["fallback"]["general"]
-    return [selected_provider, *(name for name in preferred if name != selected_provider)]
+    return provider_order(role, selected_provider, automatic, RUNTIME_CONFIG)
 
 
 def provider_timeouts(total_timeout: int, attempts: int) -> list[int]:
     """Give the preferred route enough time to finish before bounded fallbacks."""
-    total = max(30, int(total_timeout))
-    if attempts <= 1:
-        return [total]
-    if total < 60:
-        base, remainder = divmod(total, attempts)
-        return [base + (1 if index < remainder else 0) for index in range(attempts)]
-    reserve = min(45, max(20, total // 4))
-    first = total - reserve
-    fallback, remainder = divmod(reserve, attempts - 1)
-    return [first, *(fallback + (1 if index < remainder else 0) for index in range(attempts - 1))]
+    return timeout_split(total_timeout, attempts)
 
 
 def effective_timeout(requested_timeout: int, role: str) -> int:
     """Use short role-aware defaults unless a caller explicitly supplies a positive budget."""
-    if requested_timeout > 0:
-        return max(30, int(requested_timeout))
-    normalized = normalize_role(role)
-    if normalized in READ_ONLY_ROLES:
-        return DEFAULT_READ_TIMEOUT
-    if normalized in WORKER_ROLES:
-        return DEFAULT_WRITE_TIMEOUT
-    return DEFAULT_GENERAL_TIMEOUT
+    return default_timeout(requested_timeout, role, RUNTIME_CONFIG)
 
 
 def worker_prompt(task: str, role: str) -> str:

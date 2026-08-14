@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.17.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.18.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -31,12 +31,12 @@ conversation history, or state database.
 
 On Desktop Codex `0.147.0-alpha.6.5`, a fresh direct V1 probe found that the parent must explicitly
 call the V1 `wait_agent` tool after `spawn_agent`; a plain-language request to wait did not produce
-the required parent-side result. With that contract fixed, all three `gpt-5.6-sol` routes and the
-SenseNova pair for `gpt-5.6-terra` passed isolated end-to-end delivery canaries: spawn, wait,
+the required parent-side result. With that contract fixed, all three `gpt-5.5` and `gpt-5.6-sol`
+routes plus the SenseNova pair for `gpt-5.6-terra` passed isolated end-to-end delivery canaries: spawn, wait,
 nonce-bearing child JSON, bridge completion, and isolated child metadata all matched. Terra's
 `opencode-go/default` probe timed out before its parent emitted an event, so it is not accepted as
-Provider evidence. These five passing diagnostics are not production evidence; remaining routes,
-parent models, tool-bearing tasks, and the 100+ native promotion gate still require fresh evidence.
+Provider evidence. These eight passing diagnostics are not production evidence; tool-bearing tasks
+and the 100+ native promotion gate still require fresh evidence.
 Continue to use external `launch -> poll` for production.
 
 ## Job Lifecycle
@@ -53,6 +53,14 @@ States are `queued`, `running`, `succeeded`, `partial`, `blocked`, `failed`, `ca
 recorded as `failed` or `timed_out` and remains eligible for a caller-controlled new attempt.
 An asynchronous job owns its worker and OpenCode process group, so `cancel` and deadline recovery
 terminate the currently executing provider process before the terminal state is made durable.
+
+## Runtime Boundaries
+
+`relay_runtime/routing.py` owns pure secret-free policy validation, role classification, Provider
+ordering, and timeout allocation. `relay_runtime/job_store.py` owns durable job artifacts. The CLI
+owns process execution and compatibility commands; the MCP plugin remains a typed facade over the
+installed CLI. This separation prevents a policy test from spawning a Provider process and keeps
+Provider credentials outside the repository.
 
 ## Requirements
 
@@ -164,7 +172,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.17 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.18 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
