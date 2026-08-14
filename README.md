@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.14.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.15.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -29,11 +29,13 @@ includes `native-role-bisection`, which runs `builtin`, `minimal`, `model-only`,
 and full-role V1 canaries in a disposable `CODEX_HOME`. It never changes the live Codex provider,
 conversation history, or state database.
 
-On Desktop Codex `0.147.0-alpha.6.5`, the current bisection is blocked at the `builtin` layer:
-the parent emits `spawn_agent` but does not wait for a real child result, bridge completion, or
-isolated child Provider metadata. This is a parent-child lifecycle failure before third-party
-Provider routing, so changing role TOML or Provider aliases is not a production fix. Continue to
-use external `launch -> poll` until native end-to-end qualification independently passes.
+On Desktop Codex `0.147.0-alpha.6.5`, a fresh direct V1 probe found that the parent must explicitly
+call the V1 `wait_agent` tool after `spawn_agent`; a plain-language request to wait did not produce
+the required parent-side result. With that contract fixed, `gpt-5.6-sol + sensenova/explorer` passed
+one isolated end-to-end delivery canary: spawn, wait, nonce-bearing child JSON, bridge completion,
+and isolated child metadata all matched. This is one diagnostic sample, not production evidence;
+the remaining routes, parent models, tool-bearing tasks, and the 100+ native promotion gate still
+require fresh evidence. Continue to use external `launch -> poll` for production.
 
 ## Job Lifecycle
 
@@ -160,7 +162,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.14 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.15 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```

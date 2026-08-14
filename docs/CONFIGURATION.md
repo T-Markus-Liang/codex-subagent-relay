@@ -78,6 +78,9 @@ temporary CLI invocation. Plugin discovery and plugin manifests are unrelated to
 delivery and may fail independently of the parent/child protocol. This does not modify the live
 Codex configuration or disable plugins for normal Relay MCP use.
 
+The V1 parent prompt explicitly calls the namespaced `wait_agent` tool after `spawn_agent`; a
+plain-language request to wait is not enough to prove parent-side result delivery.
+
 ## Environment Variables
 
 | Variable | Purpose | Default |

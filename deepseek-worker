@@ -28,7 +28,7 @@ from typing import Any
 from relay_runtime.job_store import JobStore
 
 
-VERSION = "0.10.14"
+VERSION = "0.10.15"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1321,6 +1321,16 @@ def native_v1_command(codex: Path, catalog: Path, parent_model: str, prompt: str
     ]
 
 
+def native_v1_prompt(agent_type: str, child_task: str) -> str:
+    """Use the actual V1 wait tool name so the parent must return child evidence."""
+    return (
+        f"Use the native spawn_agent tool exactly once. Set agent_type to {agent_type} and fork_turns to none. "
+        f"Give it this task verbatim: <canary-task>{child_task}</canary-task> Then call wait_agent to wait for "
+        "that subagent's final status. Do not synthesize or repair the child response. Return the child's response "
+        "verbatim as your final response."
+    )
+
+
 def invoke_codex(
     command: list[str],
     workdir: Path,
@@ -2442,11 +2452,7 @@ def native_v1_canary(
         "Return exactly this JSON object with no Markdown or surrounding prose: "
         + json.dumps(child_contract, separators=(",", ":"))
     )
-    prompt = (
-        f"Use the native spawn_agent tool exactly once. Set agent_type to {agent_type} and fork_turns to none. "
-        f"Give it this task verbatim: <canary-task>{child_task}</canary-task> Then wait for that subagent. "
-        "Do not synthesize or repair the child response. Return the child's response verbatim as your final response."
-    )
+    prompt = native_v1_prompt(agent_type, child_task)
     config_before = file_fingerprint(CONFIG_PATH)
     state_before = state_db_snapshot()
     log_offset = BRIDGE_LOG_PATH.stat().st_size if BRIDGE_LOG_PATH.is_file() else 0

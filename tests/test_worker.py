@@ -920,6 +920,12 @@ class RouterTests(unittest.TestCase):
         self.assertIn("features.plugins=false", command)
         self.assertEqual(command[0], "/desktop/codex")
 
+    def test_native_v1_prompt_requires_actual_wait_agent_tool(self):
+        prompt = module.native_v1_prompt("explorer", "child payload")
+        self.assertIn("call wait_agent", prompt)
+        self.assertIn("agent_type to explorer", prompt)
+        self.assertIn("<canary-task>child payload</canary-task>", prompt)
+
     def test_invalid_result_uses_next_auto_provider(self):
         invalid = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Starting work."}}) + "\n"
         valid_response = '{"status":"success","summary":"done","files_changed":[],"tests":["passed"],"risks":[]}'
