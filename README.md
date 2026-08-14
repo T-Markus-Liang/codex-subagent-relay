@@ -31,11 +31,13 @@ conversation history, or state database.
 
 On Desktop Codex `0.147.0-alpha.6.5`, a fresh direct V1 probe found that the parent must explicitly
 call the V1 `wait_agent` tool after `spawn_agent`; a plain-language request to wait did not produce
-the required parent-side result. With that contract fixed, `gpt-5.6-sol + sensenova/explorer` passed
-one isolated end-to-end delivery canary: spawn, wait, nonce-bearing child JSON, bridge completion,
-and isolated child metadata all matched. This is one diagnostic sample, not production evidence;
-the remaining routes, parent models, tool-bearing tasks, and the 100+ native promotion gate still
-require fresh evidence. Continue to use external `launch -> poll` for production.
+the required parent-side result. With that contract fixed, all three `gpt-5.6-sol` routes and the
+SenseNova pair for `gpt-5.6-terra` passed isolated end-to-end delivery canaries: spawn, wait,
+nonce-bearing child JSON, bridge completion, and isolated child metadata all matched. Terra's
+`opencode-go/default` probe timed out before its parent emitted an event, so it is not accepted as
+Provider evidence. These five passing diagnostics are not production evidence; remaining routes,
+parent models, tool-bearing tasks, and the 100+ native promotion gate still require fresh evidence.
+Continue to use external `launch -> poll` for production.
 
 ## Job Lifecycle
 
