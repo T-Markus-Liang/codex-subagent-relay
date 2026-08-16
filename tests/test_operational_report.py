@@ -19,15 +19,17 @@ class OperationalReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runs.jsonl"
             rows = [
-                {"timestamp": "2026-08-13T00:00:00+00:00", "status": "success", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 10},
-                {"timestamp": "2026-08-13T01:00:00+00:00", "status": "error", "provider": "sensenova", "run_type": "external_run", "duration_seconds": 20, "fallback_used": True, "stream_retry_count": 1, "finalization_recovery_count": 1, "attempt_failure_categories": ["opencode_error_event", "invalid_structured_result"]},
-                {"timestamp": "2026-08-12T00:00:00+00:00", "status": "success", "provider": "sensenova1", "run_type": "native_v1_canary", "duration_seconds": 30},
+                {"timestamp": "2026-08-13T00:00:00+00:00", "status": "success", "provider": "sensenova", "requested_provider": "auto", "run_type": "external_run", "duration_seconds": 10},
+                {"timestamp": "2026-08-13T01:00:00+00:00", "status": "error", "provider": "sensenova", "requested_provider": "auto", "run_type": "external_run", "duration_seconds": 20, "fallback_used": True, "stream_retry_count": 1, "finalization_recovery_count": 1, "attempt_failure_categories": ["opencode_error_event", "invalid_structured_result"]},
+                {"timestamp": "2026-08-12T00:00:00+00:00", "status": "success", "provider": "sensenova1", "requested_provider": "sensenova1", "run_type": "native_v1_canary", "duration_seconds": 30},
             ]
             path.write_text("\n".join(json.dumps(row) for row in rows) + "\nnot-json\n", encoding="utf-8")
             payload = module.report(path, 7, now)
         self.assertEqual(payload["overall"]["runs"], 3)
         self.assertEqual(payload["overall"]["success_rate_percent"], 66.67)
         self.assertEqual(payload["providers"]["sensenova"]["fallback_runs"], 1)
+        self.assertEqual(payload["requested_providers"]["auto"]["runs"], 2)
+        self.assertEqual(payload["overall"]["requested_provider_counts"], {"auto": 2, "sensenova1": 1})
         self.assertEqual(payload["providers"]["sensenova"]["finalization_recovery_runs"], 1)
         self.assertEqual(payload["providers"]["sensenova"]["attempt_failure_category_counts"], {"invalid_structured_result": 1, "opencode_error_event": 1})
         self.assertEqual(payload["run_types"]["native_v1_canary"]["runs"], 1)

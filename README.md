@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.21.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.22.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -169,17 +169,17 @@ Normal cleanup leaves them untouched. First preview `cleanup --legacy-action arc
 `--apply` to move verified inactive records to the private `legacy/` directory. This never deletes or
 converts historical artifacts.
 
-Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. It reports overall plus role/Provider success rates, p50/p95 duration, fallback, partial-write, stream-retry, all-attempt usage, and accepted-success usage. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
+Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. It reports requested-route (`auto` versus explicit) and terminal-Provider counts, role/Provider success rates, p50/p95 duration, fallback, partial-write, stream-retry, all-attempt usage, and accepted-success usage. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
 
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.21 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.22 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
 
-The report separates `external_run` from native canaries and groups success rate, P50/P95, fallback,
+The report separates `external_run` from native canaries and groups requested-route (`auto` versus explicit) attribution, terminal Provider, success rate, P50/P95, fallback,
 retry, partial-write, Provider-busy blocks, bounded attempt-failure categories, and separate all-attempt versus accepted-success Relay usage by UTC day and Provider. Start a new qualifying
 seven-day window after a Relay/runtime/Provider-policy change; do not combine old versions, stress
 experiments, qualification retries, or canaries into a production SLO. The report does not include

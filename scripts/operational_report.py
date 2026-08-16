@@ -68,12 +68,14 @@ def read_rows(path: Path, cutoff: datetime) -> tuple[list[dict[str, Any]], int]:
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     statuses: dict[str, int] = defaultdict(int)
+    requested_provider_counts: dict[str, int] = defaultdict(int)
     attempt_failure_categories: dict[str, int] = defaultdict(int)
     durations: list[float] = []
     success = fallback = partial = retried = finalization_recovered = blocked = accepted_usage_rows = 0
     for row in rows:
         status = str(row.get("status") or "unknown")
         statuses[status] += 1
+        requested_provider_counts[str(row.get("requested_provider") or "unknown")] += 1
         success += int(status == "success")
         blocked += int(status == "blocked")
         fallback += int(bool(row.get("fallback_used")))
@@ -95,6 +97,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "successes": success,
         "success_rate_percent": round(100 * success / len(rows), 2) if rows else 0.0,
         "status_counts": dict(sorted(statuses.items())),
+        "requested_provider_counts": dict(sorted(requested_provider_counts.items())),
         "p50_duration_seconds": percentile(durations, 0.5),
         "p95_duration_seconds": percentile(durations, 0.95),
         "fallback_runs": fallback,
@@ -140,10 +143,12 @@ def report(
         rows = [row for row in rows if row.get("telemetry_scope") == telemetry_scope]
     by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_provider: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_requested_provider: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_run_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         by_day[row["_timestamp"].date().isoformat()].append(row)
         by_provider[str(row.get("provider") or "unknown")].append(row)
+        by_requested_provider[str(row.get("requested_provider") or "unknown")].append(row)
         by_run_type[str(row.get("run_type") or "external_run")].append(row)
     return {
         "status": "success",
@@ -162,6 +167,7 @@ def report(
         "overall": summarize(rows),
         "daily": {key: summarize(value) for key, value in sorted(by_day.items())},
         "providers": {key: summarize(value) for key, value in sorted(by_provider.items())},
+        "requested_providers": {key: summarize(value) for key, value in sorted(by_requested_provider.items())},
         "run_types": {key: summarize(value) for key, value in sorted(by_run_type.items())},
         "coverage_warning": (
             "Relay telemetry is operational evidence only. attempt_usage includes failed and retried Provider attempts; accepted_success_usage is Relay-local productive usage only when its field is present. Do not add either to Codex Rollout or CC Switch ledgers; use the separate codex-usage-audit workflow for those sources."

@@ -47,6 +47,8 @@ def relay_summary(report: dict[str, Any]) -> dict[str, Any]:
         "partial_write_runs": number(overall.get("partial_write_runs")),
         "finalization_recovery_runs": number(overall.get("finalization_recovery_runs")),
         "fallback_runs": number(overall.get("fallback_runs")),
+        "automatic_runs": number((overall.get("requested_provider_counts") or {}).get("auto")),
+        "explicit_runs": sum(number(value) for key, value in (overall.get("requested_provider_counts") or {}).items() if key not in {"auto", "unknown"}),
         "accepted_request_tokens": number(accepted.get("request_tokens")),
         "accepted_context_tokens": number(accepted.get("context_tokens")),
     }
@@ -120,6 +122,7 @@ def build_artifact(relay_report: dict[str, Any], relay_path: Path, usage_report:
         {"id": "relay_latency", "description": "P95 end-to-end Relay duration in seconds.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "P95 latency", "field": "p95_duration_seconds", "format": "number", "unit": "s"}]},
         {"id": "relay_partial", "description": "Partial writes require manual review and never auto-retry.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "Partial writes", "field": "partial_write_runs", "format": "number"}]},
         {"id": "relay_finalization", "description": "No-tool same-session attempts used to recover a missing final contract.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "Finalization recovery", "field": "finalization_recovery_runs", "format": "number"}]},
+        {"id": "relay_automatic", "description": "Jobs requested through the production automatic route, distinct from explicit diagnostics.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "Automatic jobs", "field": "automatic_runs", "format": "number"}]},
         {"id": "relay_effective_tokens", "description": "Relay-local successful final-attempt request tokens only; excludes errors, partials, and retries.", "dataset": "relay_summary", "sourceId": "relay_operations", "metrics": [{"label": "Effective Relay tokens", "field": "accepted_request_tokens", "format": "number"}]},
     ]
     blocks: list[dict[str, Any]] = [
@@ -187,6 +190,7 @@ def render_html(artifact: dict[str, Any]) -> str:
         ("P95 latency", f"{display(summary['p95_duration_seconds'])} s", "End-to-end Relay duration"),
         ("Partial writes", display(summary["partial_write_runs"]), "Require manual diff review"),
         ("Finalization recovery", display(summary["finalization_recovery_runs"]), "Same session, no tools"),
+        ("Automatic jobs", display(summary["automatic_runs"]), "Requested through auto routing"),
         ("Effective Relay tokens", display(summary["accepted_request_tokens"]), "Final success attempts only"),
     ]
     card_html = "".join(

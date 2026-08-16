@@ -551,13 +551,14 @@ class RouterTests(unittest.TestCase):
             log = Path(temporary_dir) / "runs.jsonl"
             base_time = module.datetime.now(module.UTC).replace(microsecond=0)
             log.write_text("\n".join([
-                json.dumps({"timestamp": base_time.isoformat(), "run_type": "external_run", "status": "success", "provider": "sensenova", "role": "repository-exploration", "duration_seconds": 10, "fallback_used": False, "partial_write": False, "stream_retry_count": 0, "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
-                json.dumps({"timestamp": (base_time - module.timedelta(minutes=1)).isoformat(), "run_type": "native_v1_canary", "status": "partial", "provider": "sensenova1", "role": "implementation", "duration_seconds": 20, "fallback_used": False, "partial_write": True, "stream_retry_count": 1, "usage": {"input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 2}}),
-                json.dumps({"timestamp": (base_time - module.timedelta(minutes=2)).isoformat(), "run_type": "external_run", "status": "error", "provider": "sensenova1", "role": "implementation", "duration_seconds": 30, "fallback_used": True, "partial_write": False, "stream_retry_count": 0, "usage": {"input_tokens": 30, "cached_input_tokens": 6, "output_tokens": 5, "reasoning_output_tokens": 3}}),
+                json.dumps({"timestamp": base_time.isoformat(), "run_type": "external_run", "status": "success", "provider": "sensenova", "requested_provider": "auto", "role": "repository-exploration", "duration_seconds": 10, "fallback_used": False, "partial_write": False, "stream_retry_count": 0, "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
+                json.dumps({"timestamp": (base_time - module.timedelta(minutes=1)).isoformat(), "run_type": "native_v1_canary", "status": "partial", "provider": "sensenova1", "requested_provider": "sensenova1", "role": "implementation", "duration_seconds": 20, "fallback_used": False, "partial_write": True, "stream_retry_count": 1, "usage": {"input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 2}}),
+                json.dumps({"timestamp": (base_time - module.timedelta(minutes=2)).isoformat(), "run_type": "external_run", "status": "error", "provider": "sensenova1", "requested_provider": "auto", "role": "implementation", "duration_seconds": 30, "fallback_used": True, "partial_write": False, "stream_retry_count": 0, "usage": {"input_tokens": 30, "cached_input_tokens": 6, "output_tokens": 5, "reasoning_output_tokens": 3}}),
             ]) + "\n")
             with patch.object(module, "RUN_LOG_PATH", log):
                 payload = module.stats(2)
         self.assertEqual(payload["status_counts"], {"success": 1, "partial": 1, "error": 1})
+        self.assertEqual(payload["by_requested_provider"], {"auto": 2, "sensenova1": 1})
         self.assertEqual(payload["usage"]["cached_input_tokens"], 15)
         self.assertEqual(payload["provider_stats"]["sensenova1"]["success_rate_percent"], 0.0)
         self.assertEqual(payload["by_run_type"]["external_run"]["runs"], 2)

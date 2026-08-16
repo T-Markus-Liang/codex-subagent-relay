@@ -31,7 +31,7 @@ from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runt
 from relay_runtime.telemetry import append_record, run_record
 
 
-VERSION = "0.10.21"
+VERSION = "0.10.22"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -2847,6 +2847,7 @@ def stats(hours: float) -> dict[str, Any]:
     successes = sum(1 for row in rows if row.get("status") == "success")
     status_counts: dict[str, int] = {}
     by_provider: dict[str, int] = {}
+    by_requested_provider: dict[str, int] = {}
     by_run_type: dict[str, dict[str, Any]] = {}
     provider_stats: dict[str, dict[str, Any]] = {}
     role_stats: dict[str, dict[str, Any]] = {}
@@ -2878,6 +2879,8 @@ def stats(hours: float) -> dict[str, Any]:
         status_counts[status] = status_counts.get(status, 0) + 1
         provider = str(row.get("provider") or "unknown")
         by_provider[provider] = by_provider.get(provider, 0) + 1
+        requested_provider = str(row.get("requested_provider") or "unknown")
+        by_requested_provider[requested_provider] = by_requested_provider.get(requested_provider, 0) + 1
         duration = float(row.get("duration_seconds") or 0)
         durations.append(duration)
         fallback_runs += int(bool(row.get("fallback_used")))
@@ -2926,6 +2929,7 @@ def stats(hours: float) -> dict[str, Any]:
         "successes": successes,
         "success_rate_percent": round(100 * successes / len(rows), 2) if rows else 0.0,
         "by_provider": by_provider,
+        "by_requested_provider": by_requested_provider,
         "by_run_type": by_run_type,
         "status_counts": status_counts,
         "provider_stats": provider_stats,
