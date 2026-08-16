@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.29.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.30.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -15,7 +15,7 @@ It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, Ope
 
 - Routes automatic work only to the currently retained production route. `sensenova1` is quarantined from production auto-routing after a 6.25% strict-success observation and remains available only for explicit diagnostic or qualification runs. Re-run fresh explicit qualification before restoring it.
 - Requires real tool activity, a healthy terminal stream, a strict five-field JSON result, and a matching workspace diff before accepting a result.
-- When a no-side-effect OpenCode stream has real tool activity but omits its final JSON, the relay may use a short, same-session, no-tool contract-recovery request before ordinary retry/fallback. It never replays the task or continues a changed workspace.
+- When an OpenCode stream has real tool activity but omits its final JSON, the relay may use a short, same-session, no-tool contract-finalization request before ordinary retry/fallback. After a write it can only finalize the already-completed task from naturally remaining time; any finalization tool activity or additional workspace change remains `partial`. It never replays the task or uses Provider fallback after a changed workspace.
 - Retries a stream failure once, then uses bounded Provider fallback only when the workspace is unchanged.
 - Stops on a partial write rather than replaying the task with another Provider.
 - Keeps native Codex Agent Team integrations canary-only.
@@ -174,7 +174,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.29 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.30 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
@@ -221,7 +221,7 @@ deepseek-worker --json smoke-test --provider sensenova --workdir /path/to/repo
 deepseek-worker --json stats --hours 8
 ```
 
-`run` invokes OpenCode directly with the configured third-party model IDs. Read-heavy roles use Relay's process-local `relay-readonly` Agent; implementation roles use `relay-workspace-write`. Production runs do not change Codex App root Provider or create Codex task threads. A single-route read-only job reserves up to 15 seconds from its existing timeout for a same-session, no-tool finalization recovery after confirmed task activity and no workspace change; it never extends the caller's deadline. The opaque session ID is held only in memory and is not written to job artifacts or aggregate telemetry.
+`run` invokes OpenCode directly with the configured third-party model IDs. Read-heavy roles use Relay's process-local `relay-readonly` Agent; implementation roles use `relay-workspace-write`. Production runs do not change Codex App root Provider or create Codex task threads. A single-route read-only job reserves up to 15 seconds from its existing timeout for a same-session, no-tool finalization; a write job may use only naturally remaining time after an early terminal. Both paths reject any finalization tool activity or finalization-time workspace change, never extend the caller's deadline, and never replay the original task. The opaque session ID is held only in memory and is not written to job artifacts or aggregate telemetry.
 
 Relay execution uses a process-local OpenCode envelope: `--pure`, project-config discovery disabled,
 and two injected minimal Agents (`relay-readonly` and `relay-workspace-write`) with recursive tasks

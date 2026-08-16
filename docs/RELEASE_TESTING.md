@@ -24,7 +24,7 @@ It must pass completely. It verifies:
   dry-run-first retention cleanup that never deletes active jobs. Earlier flat job artifacts are
   observable and archive-only; they are never silently deleted or fabricated into resumable jobs.
 - Run metadata excludes task text and secret-like result content.
-- Real workspace changes stop automatic retry and Provider fallback.
+- Real workspace changes stop automatic retry and Provider fallback. A same-session, no-tool finalization may still return the already-completed write result only when it leaves the post-task workspace unchanged; any finalization tool event or new change remains `partial`.
 - Native canaries remain evidence-only and must never promote a production route automatically.
 - The V1 tool canary requires hidden-token shell tool activity, parallel-call evidence, a direct `wait_agent` child result, Provider bridge completion, and isolated child metadata. It is diagnostic evidence only and does not count toward the external Worker SLO.
 - The bundled plugin manifest, repository marketplace entry, executable MCP launcher, and MCP
@@ -42,7 +42,7 @@ The release gate is a deterministic stress test of relay behavior, not a claim a
 
 | Scenario | Test shape | Required result |
 | --- | --- | --- |
-| Stream faults | malformed, guessed, no-tool, error, missing-finish, length-truncated streams, and same-session finalization recovery | no invalid result accepted; recovery never replays a task or continues after a workspace change |
+| Stream faults | malformed, guessed, no-tool, error, missing-finish, length-truncated streams, and same-session finalization recovery | no invalid result accepted; recovery never replays a task. A write can finalize only without finalization tools or post-task workspace changes. |
 | Fallback | 32 repeated invalid-primary / valid-secondary sequences | bounded retry and only valid secondary acceptance |
 | Write contention | 12 simultaneous lock contenders for one workdir | exactly one owner, 11 blocked |
 | Job isolation | 24 concurrent `launch` operations | unique job IDs and private metadata/stdout/stderr paths |
@@ -124,7 +124,7 @@ For the required seven-day operational observation, generate a source-local UTC 
 each day and preserve only the redacted aggregate report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.29 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.30 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```

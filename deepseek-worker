@@ -36,7 +36,7 @@ from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runt
 from relay_runtime.telemetry import append_record, run_record
 
 
-VERSION = "0.10.29"
+VERSION = "0.10.30"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -641,8 +641,9 @@ def initial_execution_timeout(allocated_seconds: int, sandbox: str, provider_cou
     """Reserve a same-session finalization window for one read-only Provider.
 
     The reserve is part of the caller's existing timeout, not extra wall-clock time. It is
-    unavailable to write work (where post-change recovery must not continue execution) and to
-    multi-Provider routes (where the allocation belongs to fallback policy).
+    unavailable to multi-Provider routes (where the allocation belongs to fallback policy). Write
+    work receives no up-front reserve, but an early terminal may still use naturally remaining time
+    for one same-session no-tool contract finalization; it never replays the write task.
     """
     if sandbox == "read-only" and provider_count == 1 and allocated_seconds > FINALIZATION_RESERVE_SECONDS:
         return allocated_seconds - FINALIZATION_RESERVE_SECONDS
@@ -1931,8 +1932,9 @@ def _run_worker_locked(
                 recovered_finalization = False
                 recovered_usage: dict[str, int] | None = None
                 finalization_used_tools = False
+                finalization_changed_workspace = False
                 recovery_budget = finalization_timeout(int(finalization_deadline - time.monotonic()))
-                if message is None and task_activity and not attempt_changes and stream["failure"] is not None:
+                if message is None and task_activity and stream["failure"] is not None:
                     if completed.returncode not in {0, 124}:
                         finalization_skip_reason = "process_exit"
                     elif session_id is None:
@@ -1957,7 +1959,11 @@ def _run_worker_locked(
                         completed = recovery
                         stream = opencode_stream_diagnostics(recovery.stdout)
                         last_stream = stream
+                        before_finalization_snapshot = attempt_snapshot
                         attempt_snapshot = workspace_snapshot(workdir)
+                        finalization_changed_workspace = bool(
+                            changed_workspace_paths(before_finalization_snapshot, attempt_snapshot)
+                        )
                         attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
                         recovered_finalization = True
                         used_finalization_recovery = True
@@ -1971,6 +1977,7 @@ def _run_worker_locked(
                     and message is not None
                     and task_activity
                     and not finalization_used_tools
+                    and not finalization_changed_workspace
                     and not declared_mismatch
                     and stream["failure"] is None
                 ):
@@ -1982,6 +1989,8 @@ def _run_worker_locked(
                 category = (
                     "finalization_used_tools"
                     if finalization_used_tools
+                    else "finalization_changed_workspace"
+                    if finalization_changed_workspace
                     else attempt_failure_category(completed, stream, message, invalid_result, task_activity, declared_mismatch)
                 )
                 attempts.append(
@@ -1993,6 +2002,8 @@ def _run_worker_locked(
                             if declared_mismatch
                             else "same-session finalization unexpectedly used a task tool"
                             if finalization_used_tools
+                            else "same-session finalization changed the workspace"
+                            if finalization_changed_workspace
                             else str(stream["failure"])
                             if stream["failure"] is not None
                             else "invalid structured worker result"

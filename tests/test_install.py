@@ -33,7 +33,7 @@ class InstallTests(unittest.TestCase):
             self.assertFalse(launcher.is_symlink())
             version = subprocess.run([str(launcher), "--version"], text=True, capture_output=True, check=False)
             self.assertEqual(version.returncode, 0, version.stderr)
-        self.assertEqual(version.stdout.strip(), "0.10.29")
+        self.assertEqual(version.stdout.strip(), "0.10.30")
 
 
 if __name__ == "__main__":

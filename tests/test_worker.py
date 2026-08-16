@@ -1151,6 +1151,45 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["files_changed"], ["README.md"])
         self.assertEqual(payload["finalization_recovery_count"], 1)
 
+    def test_write_stream_can_finalize_same_session_without_replaying_or_changing_files(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "tool-calls"}},
+        ]))
+        response = '{"status":"success","summary":"wrote README","files_changed":["README.md"],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        snapshots = [{}, {"README.md": "changed"}, {"README.md": "changed"}, {"README.md": "changed"}]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="edit README", task_file=None, role="documentation", workdir=workdir, provider="sensenova", sandbox="workspace-write", timeout=90, no_record=True)
+            with patch.object(module, "workspace_snapshot", side_effect=snapshots), patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 0, initial, ""), module.subprocess.CompletedProcess([], 0, recovery, "")]) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertIn("--session", invoke.call_args_list[1].args[0])
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["files_changed"], ["README.md"])
+        self.assertEqual(payload["finalization_recovery_count"], 1)
+
+    def test_write_finalization_mutation_is_partial_and_never_accepted(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "tool-calls"}},
+        ]))
+        response = '{"status":"success","summary":"wrote files","files_changed":["README.md","unexpected.txt"],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        snapshots = [{}, {"README.md": "changed"}, {"README.md": "changed", "unexpected.txt": "changed"}, {"README.md": "changed", "unexpected.txt": "changed"}]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="edit README", task_file=None, role="documentation", workdir=workdir, provider="sensenova", sandbox="workspace-write", timeout=90, no_record=True)
+            with patch.object(module, "workspace_snapshot", side_effect=snapshots), patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 0, initial, ""), module.subprocess.CompletedProcess([], 0, recovery, "")]):
+                payload = module.run_worker(args)
+        self.assertEqual(payload["status"], "partial")
+        self.assertIn("finalization_changed_workspace", payload["attempt_failure_categories"])
+
     def test_finalization_tool_use_is_not_accepted_as_a_second_execution(self):
         initial = "\n".join(map(json.dumps, [
             {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
