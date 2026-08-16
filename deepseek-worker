@@ -31,7 +31,7 @@ from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runt
 from relay_runtime.telemetry import append_record, run_record
 
 
-VERSION = "0.10.22"
+VERSION = "0.10.23"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -630,6 +630,18 @@ def opencode_session_id(stdout: str) -> str | None:
 def finalization_timeout(remaining_seconds: int) -> int:
     """Use only time naturally left after an early stream terminal, never steal task runtime."""
     return min(FINALIZATION_RESERVE_SECONDS, max(0, remaining_seconds))
+
+
+def initial_execution_timeout(allocated_seconds: int, sandbox: str, provider_count: int) -> int:
+    """Reserve a same-session finalization window for one read-only Provider.
+
+    The reserve is part of the caller's existing timeout, not extra wall-clock time. It is
+    unavailable to write work (where post-change recovery must not continue execution) and to
+    multi-Provider routes (where the allocation belongs to fallback policy).
+    """
+    if sandbox == "read-only" and provider_count == 1 and allocated_seconds > FINALIZATION_RESERVE_SECONDS:
+        return allocated_seconds - FINALIZATION_RESERVE_SECONDS
+    return allocated_seconds
 
 
 def combined_usage(*values: dict[str, int]) -> dict[str, int]:
@@ -1888,7 +1900,10 @@ def _run_worker_locked(
             break
         try:
             command = adapter_command(provider, workdir, decision["role"], sandbox, task)
-            provider_deadline = time.monotonic() + attempt_timeouts[attempt_index]
+            allocated_seconds = attempt_timeouts[attempt_index]
+            execution_seconds = initial_execution_timeout(allocated_seconds, sandbox, len(provider_order))
+            provider_deadline = time.monotonic() + execution_seconds
+            finalization_deadline = provider_deadline + (allocated_seconds - execution_seconds)
             stream_retry_count = 0
             while True:
                 remaining_seconds = max(1, int(provider_deadline - time.monotonic()))
@@ -1910,9 +1925,9 @@ def _run_worker_locked(
                 recovered_finalization = False
                 recovered_usage: dict[str, int] | None = None
                 finalization_used_tools = False
-                recovery_budget = finalization_timeout(int(provider_deadline - time.monotonic()))
+                recovery_budget = finalization_timeout(int(finalization_deadline - time.monotonic()))
                 if (
-                    completed.returncode == 0
+                    completed.returncode in {0, 124}
                     and message is None
                     and task_activity
                     and not attempt_changes

@@ -66,6 +66,11 @@ def verify_workspace(workdir: Path, role: str) -> tuple[bool, bool, str]:
 def failure_class(payload: dict, workspace_reason: str) -> str | None:
     if workspace_reason != "ok":
         return workspace_reason
+    if payload.get("status") == "blocked":
+        categories = payload.get("attempt_failure_categories") or []
+        if "provider_busy" in categories:
+            return "worker:provider_busy"
+        return "worker:blocked"
     if payload.get("status") == "success":
         return None
     finish_reason = payload.get("stream_finish_reason")

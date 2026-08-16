@@ -53,7 +53,7 @@ class RelayMcpTests(unittest.TestCase):
             launcher.parent.mkdir(parents=True)
             launcher.write_text("#!/bin/sh\n", encoding="utf-8")
             launcher.chmod(0o755)
-            cached_server = Path(temporary_cache) / "marketplace/plugin/0.10.22/mcp/server.py"
+            cached_server = Path(temporary_cache) / "marketplace/plugin/0.10.23/mcp/server.py"
             cached_server.parent.mkdir(parents=True)
             cached_server.write_text("# cache placeholder\n", encoding="utf-8")
             with patch("pathlib.Path.home", return_value=home):

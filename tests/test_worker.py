@@ -106,6 +106,11 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(module.finalization_timeout(60), 15)
         self.assertEqual(module.finalization_timeout(4), 4)
 
+    def test_single_read_route_reserves_finalization_budget_without_extending_timeout(self):
+        self.assertEqual(module.initial_execution_timeout(75, "read-only", 1), 60)
+        self.assertEqual(module.initial_execution_timeout(120, "workspace-write", 1), 120)
+        self.assertEqual(module.initial_execution_timeout(75, "read-only", 2), 75)
+
     def test_invoke_codex_closes_stdin(self):
         class DummyProcess:
             pid = 123
@@ -1071,6 +1076,27 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["finalization_recovery_count"], 1)
         self.assertEqual(payload["usage"], {"input_tokens": 12, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 4, "reasoning_output_tokens": 0})
         self.assertEqual(payload["accepted_usage"], {"input_tokens": 2, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0})
+
+    def test_read_timeout_can_finalize_the_same_session_without_replaying_tools(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "tool-calls"}},
+        ]))
+        response = '{"status":"success","summary":"done","files_changed":[],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="read-only", timeout=75, no_record=True)
+            with patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 124, initial, "timed out"), module.subprocess.CompletedProcess([], 0, recovery, "")]) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertLessEqual(invoke.call_args_list[0].args[2], 60)
+        self.assertGreaterEqual(invoke.call_args_list[0].args[2], 59)
+        self.assertLessEqual(invoke.call_args_list[1].args[2], 15)
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["finalization_recovery_count"], 1)
 
     def test_finalization_change_stays_partial_and_never_falls_back(self):
         initial = "\n".join(map(json.dumps, [

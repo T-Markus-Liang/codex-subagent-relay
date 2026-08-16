@@ -44,6 +44,7 @@ class LiveSoakTests(unittest.TestCase):
     def test_failure_class_includes_workspace_and_stream_failures(self):
         self.assertEqual(module.failure_class({"status": "success"}, "write content mismatch"), "write content mismatch")
         self.assertEqual(module.failure_class({"status": "error", "stream_finish_reason": "length"}, "ok"), "stream:length")
+        self.assertEqual(module.failure_class({"status": "blocked", "attempt_failure_categories": ["provider_busy"]}, "ok"), "worker:provider_busy")
         self.assertIsNone(module.failure_class({"status": "success"}, "ok"))
 
     def test_consecutive_failure_stop_requires_only_recent_non_successes(self):
