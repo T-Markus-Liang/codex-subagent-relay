@@ -41,10 +41,11 @@ model = "deepseek-v4-flash"
 
 The actual base URL, authentication, and Provider-specific setup belong in your private Codex/OpenCode integration. Never commit those files. The Worker invokes OpenCode directly, so OpenCode must independently resolve each model ID. A profile that merely exists does not prove the Provider can run tasks.
 
-Relay launches OpenCode with `--pure`: its bounded execution and same-session finalization calls use
-built-in tools only and do not load the user's external OpenCode plugins. This isolates qualification
-and production Worker reliability from unrelated UI or project plugins; it does not change normal
-interactive OpenCode sessions or private Provider credentials.
+Relay launches OpenCode inside a process-local execution envelope: `--pure`, disabled project-config
+discovery, and injected minimal `relay-readonly` / `relay-workspace-write` Agents with recursive tasks
+disabled. It preserves global Provider settings and private credentials, but avoids the project-defined
+`plan` / `build` Agent behavior that can interfere with bounded tasks. Managed OpenCode policy still
+applies. This does not modify normal interactive OpenCode sessions or configuration files.
 
 ## Required Local Tools
 

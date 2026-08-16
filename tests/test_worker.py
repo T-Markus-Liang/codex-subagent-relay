@@ -95,7 +95,7 @@ class RouterTests(unittest.TestCase):
         self.assertIn("--pure", command)
         self.assertEqual(command[0], str(module.OPENCODE_PATH))
         self.assertEqual(command[command.index("--dir") + 1], temporary_dir)
-        self.assertEqual(command[command.index("--agent") + 1], "plan")
+        self.assertEqual(command[command.index("--agent") + 1], "relay-readonly")
         self.assertEqual(command[command.index("--model") + 1], "sensenova1/deepseek-v4-flash")
 
     def test_finalization_command_reuses_session_and_preserves_role_sandbox(self):
@@ -103,10 +103,28 @@ class RouterTests(unittest.TestCase):
             command = module.finalization_command(Path(temporary_dir), "session_abcdefgh", "read-only")
         self.assertIn("--pure", command)
         self.assertEqual(command[command.index("--session") + 1], "session_abcdefgh")
-        self.assertEqual(command[command.index("--agent") + 1], "plan")
+        self.assertEqual(command[command.index("--agent") + 1], "relay-readonly")
         self.assertIn("Do not make any changes", command[-1])
         self.assertEqual(module.finalization_timeout(60), 15)
         self.assertEqual(module.finalization_timeout(4), 4)
+
+    def test_relay_execution_environment_preserves_provider_overrides_and_uses_minimal_agents(self):
+        original = {"OPENCODE_CONFIG_CONTENT": json.dumps({"provider": {"private": {"models": {}}}})}
+        environment = module.execution_environment(original, "read-only")
+        overlay = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
+        self.assertIn("private", overlay["provider"])
+        self.assertEqual(environment["OPENCODE_DISABLE_PROJECT_CONFIG"], "true")
+        self.assertEqual(environment["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"], "131072")
+        self.assertEqual(overlay["subagent_depth"], 0)
+        self.assertEqual(overlay["agent"]["relay-readonly"]["permission"]["*"], "deny")
+        self.assertEqual(overlay["agent"]["relay-readonly"]["permission"]["read"], "allow")
+        self.assertEqual(overlay["agent"]["relay-workspace-write"]["permission"]["edit"], "allow")
+        self.assertEqual(overlay["agent"]["relay-workspace-write"]["permission"]["bash"], "allow")
+
+    def test_invalid_existing_inline_config_does_not_block_relay_agent_overlay(self):
+        environment = module.execution_environment({"OPENCODE_CONFIG_CONTENT": "not-json"}, "workspace-write")
+        overlay = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(overlay["agent"]["relay-workspace-write"]["mode"], "primary")
 
     def test_single_read_route_reserves_finalization_budget_without_extending_timeout(self):
         self.assertEqual(module.initial_execution_timeout(75, "read-only", 1), 60)
@@ -1049,6 +1067,7 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(invoke.call_count, 2)
         self.assertEqual(invoke.call_args_list[0].args[0], invoke.call_args_list[1].args[0])
         self.assertEqual(invoke.call_args_list[0].kwargs["env"]["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"], "131072")
+        self.assertEqual(invoke.call_args_list[0].kwargs["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"], "true")
         self.assertEqual(payload["status"], "success")
         self.assertIn("bounded same-provider stream retry was used", payload["risks"])
         self.assertEqual(payload["stream_finish_reason"], "stop")

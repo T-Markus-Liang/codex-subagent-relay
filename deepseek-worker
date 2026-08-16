@@ -26,12 +26,17 @@ from pathlib import Path
 from typing import Any
 
 from relay_runtime.job_store import JobStore
-from relay_runtime.opencode_adapter import AdapterConfigError, finalization_command as build_finalization_command, task_command
+from relay_runtime.opencode_adapter import (
+    AdapterConfigError,
+    execution_environment,
+    finalization_command as build_finalization_command,
+    task_command,
+)
 from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runtime_config as load_policy, provider_order, resolve_route, timeout_split
 from relay_runtime.telemetry import append_record, run_record
 
 
-VERSION = "0.10.28"
+VERSION = "0.10.29"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1913,7 +1918,7 @@ def _run_worker_locked(
                         command,
                         workdir,
                         remaining_seconds,
-                        env={**os.environ, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "131072"},
+                        env=execution_environment(os.environ, sandbox),
                     )
                 except FileNotFoundError as exc:
                     raise WorkerError("opencode command not found") from exc
@@ -1940,7 +1945,7 @@ def _run_worker_locked(
                                 finalization_command(workdir, session_id, sandbox),
                                 workdir,
                                 recovery_budget,
-                                env={**os.environ, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "131072"},
+                                env=execution_environment(os.environ, sandbox),
                             )
                         except FileNotFoundError as exc:
                             raise WorkerError("opencode command not found") from exc
