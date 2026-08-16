@@ -36,7 +36,7 @@ from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runt
 from relay_runtime.telemetry import append_record, run_record
 
 
-VERSION = "0.10.30"
+VERSION = "0.10.31"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -638,14 +638,14 @@ def finalization_timeout(remaining_seconds: int) -> int:
 
 
 def initial_execution_timeout(allocated_seconds: int, sandbox: str, provider_count: int) -> int:
-    """Reserve a same-session finalization window for one read-only Provider.
+    """Reserve a bounded contract-finalization window for one Provider.
 
     The reserve is part of the caller's existing timeout, not extra wall-clock time. It is
-    unavailable to multi-Provider routes (where the allocation belongs to fallback policy). Write
-    work receives no up-front reserve, but an early terminal may still use naturally remaining time
-    for one same-session no-tool contract finalization; it never replays the write task.
+    unavailable to multi-Provider routes (where the allocation belongs to fallback policy). A
+    write may use the reserve only after its initial process exits naturally; this never replays
+    the write task or accepts a Worker-forced timeout as completed work.
     """
-    if sandbox == "read-only" and provider_count == 1 and allocated_seconds > FINALIZATION_RESERVE_SECONDS:
+    if provider_count == 1 and allocated_seconds > FINALIZATION_RESERVE_SECONDS:
         return allocated_seconds - FINALIZATION_RESERVE_SECONDS
     return allocated_seconds
 
@@ -1935,7 +1935,7 @@ def _run_worker_locked(
                 finalization_changed_workspace = False
                 recovery_budget = finalization_timeout(int(finalization_deadline - time.monotonic()))
                 if message is None and task_activity and stream["failure"] is not None:
-                    if completed.returncode not in {0, 124}:
+                    if completed.returncode != 0 and not (sandbox == "read-only" and completed.returncode == 124):
                         finalization_skip_reason = "process_exit"
                     elif session_id is None:
                         finalization_skip_reason = "session_unavailable"

@@ -126,9 +126,9 @@ class RouterTests(unittest.TestCase):
         overlay = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
         self.assertEqual(overlay["agent"]["relay-workspace-write"]["mode"], "primary")
 
-    def test_single_read_route_reserves_finalization_budget_without_extending_timeout(self):
+    def test_single_provider_reserves_finalization_budget_without_extending_timeout(self):
         self.assertEqual(module.initial_execution_timeout(75, "read-only", 1), 60)
-        self.assertEqual(module.initial_execution_timeout(120, "workspace-write", 1), 120)
+        self.assertEqual(module.initial_execution_timeout(120, "workspace-write", 1), 105)
         self.assertEqual(module.initial_execution_timeout(75, "read-only", 2), 75)
 
     def test_invoke_codex_closes_stdin(self):
@@ -1171,6 +1171,21 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["files_changed"], ["README.md"])
         self.assertEqual(payload["finalization_recovery_count"], 1)
+
+    def test_write_timeout_never_finalizes_a_forced_termination(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "tool-calls"}},
+        ]))
+        snapshots = [{}, {"README.md": "changed"}, {"README.md": "changed"}]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="edit README", task_file=None, role="documentation", workdir=workdir, provider="sensenova", sandbox="workspace-write", timeout=90, no_record=True)
+            with patch.object(module, "workspace_snapshot", side_effect=snapshots), patch.object(module, "invoke_codex", return_value=module.subprocess.CompletedProcess([], 124, initial, "timed out")) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 1)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["finalization_recovery_count"], 0)
+        self.assertEqual(payload["finalization_skip_reason"], "process_exit")
 
     def test_write_finalization_mutation_is_partial_and_never_accepted(self):
         initial = "\n".join(map(json.dumps, [
