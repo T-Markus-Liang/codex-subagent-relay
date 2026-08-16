@@ -20,7 +20,7 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_tracked_manifest_is_structurally_valid_without_live_evidence(self):
         result = module.validate_manifest(self.manifest)
-        self.assertEqual(result["routes"], ["sensenova", "sensenova1"])
+        self.assertEqual(result["routes"], ["sensenova"])
         self.assertEqual(result["records"], 0)
 
     def test_complete_evidence_passes_publication_gate(self):
@@ -34,9 +34,9 @@ class CompatibilityTests(unittest.TestCase):
                 "write_success_rate": 0.98,
                 "duplicate_writes": 0,
             }
-            for provider in ("sensenova", "sensenova1")
+            for provider in ("sensenova",)
         ]
-        self.assertEqual(module.validate_manifest(payload, require_evidence=True)["records"], 2)
+        self.assertEqual(module.validate_manifest(payload, require_evidence=True)["records"], 1)
 
     def test_unknown_field_and_native_promotion_are_rejected(self):
         unknown = copy.deepcopy(self.manifest)

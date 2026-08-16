@@ -1,15 +1,11 @@
 {
-  "relay_version": "0.10.20",
+  "relay_version": "0.10.21",
   "minimum_python": "3.11",
   "adapter": "opencode",
   "production_routes": [
     {
       "provider": "sensenova",
       "model": "sensenova/deepseek-v4-flash"
-    },
-    {
-      "provider": "sensenova1",
-      "model": "sensenova1/deepseek-v4-flash"
     }
   ],
   "native": {

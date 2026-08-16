@@ -30,6 +30,6 @@ sol = ["architecture", "planning", "complex-decision", "decision", "final-review
 terra = ["review", "validation", "second-opinion"]
 
 [fallback]
-read_only = ["sensenova", "sensenova1"]
-worker = ["sensenova", "sensenova1"]
-general = ["sensenova", "sensenova1"]
+read_only = ["sensenova"]
+worker = ["sensenova"]
+general = ["sensenova"]

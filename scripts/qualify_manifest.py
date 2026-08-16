@@ -79,7 +79,7 @@ def build_record(route: str, read_rate: float, write_rate: float, read: dict[str
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--route", required=True, choices=("sensenova", "sensenova1"))
+    parser.add_argument("--route", required=True, choices=("sensenova",))
     parser.add_argument("--read-report", type=Path, required=True)
     parser.add_argument("--write-report", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)

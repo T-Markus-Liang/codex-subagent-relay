@@ -37,8 +37,8 @@ class RouterTests(unittest.TestCase):
 
     def test_declarative_runtime_config_matches_current_production_policy(self):
         config = module.load_runtime_config(module.ROOT / "relay.toml")
-        self.assertEqual(config["fallback"]["read_only"], ("sensenova", "sensenova1"))
-        self.assertEqual(config["fallback"]["worker"], ("sensenova", "sensenova1"))
+        self.assertEqual(config["fallback"]["read_only"], ("sensenova",))
+        self.assertEqual(config["fallback"]["worker"], ("sensenova",))
         self.assertEqual(config["providers"]["sensenova1"]["adapter"], "opencode")
         self.assertEqual(config["timeouts"]["read_only_seconds"], 75)
 
@@ -494,11 +494,11 @@ class RouterTests(unittest.TestCase):
     def test_auto_provider_order_is_role_specific(self):
         self.assertEqual(
             module.build_provider_order("repository-exploration", "sensenova", True),
-            ["sensenova", "sensenova1"],
+            ["sensenova"],
         )
         self.assertEqual(
             module.build_provider_order("implementation", "sensenova", True),
-            ["sensenova", "sensenova1"],
+            ["sensenova"],
         )
 
     def test_circuit_breaker_persists_across_calls_and_explicit_provider_bypasses(self):
@@ -986,12 +986,14 @@ class RouterTests(unittest.TestCase):
                 timeout=90,
                 no_record=True,
             )
-            with patch.object(module, "invoke_codex", side_effect=results) as invoke, \
+            fallback_config = {**module.RUNTIME_CONFIG, "fallback": {**module.RUNTIME_CONFIG["fallback"], "read_only": ("sensenova", "sensenova1")}}
+            with patch.object(module, "RUNTIME_CONFIG", fallback_config), \
+                 patch.object(module, "invoke_codex", side_effect=results) as invoke, \
                  patch.object(module, "CIRCUIT_STATE_PATH", Path(circuit_dir) / "circuit.json"), \
                  patch.object(module, "CIRCUIT_LOCK_PATH", Path(circuit_dir) / "circuit.lock"):
                 payload = module.run_worker(args)
         self.assertEqual(invoke.call_count, 2)
-        fallback = module.RUNTIME_CONFIG["fallback"]["read_only"]
+        fallback = ("sensenova", "sensenova1")
         self.assertIn(f"{fallback[1]}/deepseek-v4-flash", invoke.call_args_list[1].args[0])
         self.assertEqual(payload["provider"], fallback[1])
         self.assertIn("provider fallback was used after an earlier DeepSeek route failed", payload["risks"])
@@ -1143,7 +1145,8 @@ class RouterTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as workdir:
             args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="auto", sandbox="auto", timeout=90, no_record=True)
-            with patch.object(module, "invoke_codex", side_effect=results):
+            fallback_config = {**module.RUNTIME_CONFIG, "fallback": {**module.RUNTIME_CONFIG["fallback"], "read_only": ("sensenova", "sensenova1")}}
+            with patch.object(module, "RUNTIME_CONFIG", fallback_config), patch.object(module, "invoke_codex", side_effect=results):
                 payload = module.run_worker(args)
         self.assertEqual(payload["usage"], {"input_tokens": 30, "output_tokens": 5})
         self.assertEqual(payload["accepted_usage"], {"input_tokens": 20, "output_tokens": 3})
@@ -1170,7 +1173,8 @@ class RouterTests(unittest.TestCase):
         completed = module.subprocess.CompletedProcess([], 0, no_tools, "")
         with tempfile.TemporaryDirectory() as workdir:
             args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="auto", sandbox="auto", timeout=90, no_record=True)
-            with patch.object(module, "invoke_codex", return_value=completed) as invoke:
+            fallback_config = {**module.RUNTIME_CONFIG, "fallback": {**module.RUNTIME_CONFIG["fallback"], "read_only": ("sensenova", "sensenova1")}}
+            with patch.object(module, "RUNTIME_CONFIG", fallback_config), patch.object(module, "invoke_codex", return_value=completed) as invoke:
                 payload = module.run_worker(args)
         self.assertEqual(invoke.call_count, 2)
         self.assertEqual(payload["status"], "error")

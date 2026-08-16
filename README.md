@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.20.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.21.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -13,7 +13,7 @@ It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, Ope
 
 ## What It Does
 
-- Routes automatic work to the currently qualified/healthy Provider first and uses the other SenseNova route as bounded fallback. The checked-in order is currently `sensenova -> sensenova1` because the latest explicit smoke showed `sensenova` healthy while `sensenova1` returned upstream stream errors. Re-run explicit smoke before changing this order.
+- Routes automatic work only to the currently retained production route. `sensenova1` is quarantined from production auto-routing after a 6.25% strict-success observation and remains available only for explicit diagnostic or qualification runs. Re-run fresh explicit qualification before restoring it.
 - Requires real tool activity, a healthy terminal stream, a strict five-field JSON result, and a matching workspace diff before accepting a result.
 - When a no-side-effect OpenCode stream has real tool activity but omits its final JSON, the relay may use a short, same-session, no-tool contract-recovery request before ordinary retry/fallback. It never replays the task or continues a changed workspace.
 - Retries a stream failure once, then uses bounded Provider fallback only when the workspace is unchanged.
@@ -153,11 +153,11 @@ The relay adds bounded metadata such as Provider, duration, usage, and stream re
 
 | Role family | Default Provider order | Sandbox | Default budget |
 | --- | --- | --- | --- |
-| `search`, `repository-exploration`, `logs` | `sensenova -> sensenova1` | read-only | 75 seconds |
-| `implementation`, `test`, `debug`, `refactor`, `docs` | `sensenova -> sensenova1` | workspace-write | 120 seconds |
+| `search`, `repository-exploration`, `logs` | `sensenova` | read-only | 75 seconds |
+| `implementation`, `test`, `debug`, `refactor`, `docs` | `sensenova` | workspace-write | 120 seconds |
 | architecture, planning, final review | kept by the caller | n/a | n/a |
 
-`opencode-go` is available only with an explicit `--provider` for diagnostics; it is not part of automatic production fallback. The Worker serializes concurrent write tasks per workdir. A write that changes files but fails the result contract returns `partial` and stops all retry/fallback. Review that diff manually.
+`sensenova1` and `opencode-go` are available only with an explicit `--provider` for diagnostics or qualification; neither is part of automatic production routing. The Worker serializes concurrent write tasks per workdir. A write that changes files but fails the result contract returns `partial` and stops all retry/fallback. Review that diff manually.
 
 Terminal job artifacts are retained for seven days by default. Cleanup is a dry run unless
 `--apply` is supplied; it never deletes queued/running jobs, malformed directories, or jobs completed
@@ -174,7 +174,7 @@ Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.20 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.21 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```

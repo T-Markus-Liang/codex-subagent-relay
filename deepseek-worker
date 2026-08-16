@@ -31,7 +31,7 @@ from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runt
 from relay_runtime.telemetry import append_record, run_record
 
 
-VERSION = "0.10.20"
+VERSION = "0.10.21"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -1810,6 +1810,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 "risks": ["provider circuit state is fail-open when its state file cannot be read or written"],
                 "usage": {},
                 "duration_seconds": 0.0,
+                "requested_provider": args.provider,
+                "fallback_attempted": False,
             }
             if not args.no_record:
                 record_run(payload, run_type="external_run", telemetry_scope=getattr(args, "telemetry_scope", "production"))
@@ -1831,6 +1833,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 "risks": [str(exc)],
                 "usage": {},
                 "duration_seconds": 0.0,
+                "requested_provider": args.provider,
+                "fallback_attempted": False,
             }
             if not args.no_record:
                 record_run(payload, run_type="external_run", telemetry_scope=getattr(args, "telemetry_scope", "production"))
@@ -2062,6 +2066,8 @@ def _run_worker_locked(
             "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
+    payload["requested_provider"] = args.provider
+    payload["fallback_attempted"] = automatic and provider != selected_provider
     if automatic and accepted:
         circuit_success(provider)
     if not args.no_record:

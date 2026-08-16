@@ -15,7 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "compatibility" / "manifest.json"
 PRODUCTION_ROUTES = {
     "sensenova": "sensenova/deepseek-v4-flash",
-    "sensenova1": "sensenova1/deepseek-v4-flash",
 }
 TOP_LEVEL_KEYS = {
     "relay_version",
