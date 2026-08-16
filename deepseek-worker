@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 """Run bounded execution tasks through the configured DeepSeek Codex profiles."""
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -24,8 +25,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from relay_runtime.job_store import JobStore
+from relay_runtime.opencode_adapter import (
+    AdapterConfigError,
+    execution_environment,
+    finalization_command as build_finalization_command,
+    task_command,
+)
+from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runtime_config as load_policy, provider_order, resolve_route, timeout_split
+from relay_runtime.telemetry import append_record, run_record
 
-VERSION = "0.9.0"
+
+VERSION = "0.10.31"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
@@ -35,6 +46,7 @@ CONFIG_PATH = CODEX_HOME / "config.toml"
 RUN_LOG_PATH = CODEX_HOME / "deepseek-worker-runs.jsonl"
 CIRCUIT_STATE_PATH = CODEX_HOME / "deepseek-worker-circuit.json"
 CIRCUIT_LOCK_PATH = CODEX_HOME / "deepseek-worker-circuit.lock"
+PROVIDER_LOCK_ROOT = CODEX_HOME / "deepseek-worker-provider-locks"
 JOB_ROOT = CODEX_HOME / "deepseek-worker-jobs"
 MAX_FALLBACK_SNAPSHOT_FILES = 10000
 DEFAULT_CATALOG_PATH = CODEX_HOME / "deepseek-subagent-model-catalog.json"
@@ -55,61 +67,29 @@ JOB_SCHEMA_VERSION = 1
 JOB_STATES = {"queued", "running", "succeeded", "partial", "blocked", "failed", "cancelled", "timed_out"}
 TERMINAL_JOB_STATES = {"succeeded", "partial", "blocked", "failed", "cancelled", "timed_out"}
 JOB_TIMEOUT_GRACE_SECONDS = 15
+DEFAULT_TERMINAL_JOB_RETENTION_HOURS = 168
+MAX_TERMINAL_JOB_RETENTION_HOURS = 24 * 365
+NATIVE_ROLE_LAYERS = ("builtin", "minimal", "model-only", "provider-only", "full")
 
 class WorkerError(RuntimeError):
     pass
 
 
+def valid_job_id(job_id: str) -> bool:
+    return bool(job_id) and all(char in "0123456789abcdef-" for char in job_id)
+
+
+def job_store() -> JobStore:
+    """Create storage on demand so tests and isolated homes can replace JOB_ROOT."""
+    return JobStore(JOB_ROOT, valid_job_id)
+
+
 def load_runtime_config(path: Path = RUNTIME_CONFIG_PATH) -> dict[str, Any]:
-    """Load declarative routing without accepting credentials or arbitrary adapters."""
+    """Compatibility boundary that maps runtime-policy errors to the CLI error type."""
     try:
-        with path.open("rb") as handle:
-            config = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise WorkerError(f"invalid relay configuration: {type(exc).__name__}") from exc
-    if not isinstance(config, dict) or config.get("schema_version") != 1:
-        raise WorkerError("unsupported relay configuration schema")
-    providers = config.get("providers")
-    roles = config.get("roles")
-    timeouts = config.get("timeouts")
-    fallback = config.get("fallback")
-    if not all(isinstance(value, dict) for value in (providers, roles, timeouts, fallback)):
-        raise WorkerError("relay configuration has missing sections")
-    normalized_providers: dict[str, dict[str, Any]] = {}
-    for name, metadata in providers.items():
-        if not isinstance(name, str) or not isinstance(metadata, dict):
-            raise WorkerError("relay configuration has invalid provider")
-        if metadata.get("adapter") != "opencode" or not isinstance(metadata.get("profile"), str) or not isinstance(metadata.get("model"), str):
-            raise WorkerError("relay configuration has invalid provider adapter")
-        try:
-            port = int(metadata.get("port"))
-        except (TypeError, ValueError) as exc:
-            raise WorkerError("relay configuration has invalid provider port") from exc
-        if not 1 <= port <= 65535:
-            raise WorkerError("relay configuration has invalid provider port")
-        normalized_providers[name] = {**metadata, "port": port}
-    normalized_roles: dict[str, set[str]] = {}
-    for name in ("read_only", "worker", "sol", "terra"):
-        values = roles.get(name)
-        if not isinstance(values, list) or not values or not all(isinstance(value, str) and value for value in values):
-            raise WorkerError("relay configuration has invalid role policy")
-        normalized_roles[name] = set(values)
-    normalized_fallback: dict[str, tuple[str, ...]] = {}
-    for name in ("read_only", "worker", "general"):
-        values = fallback.get(name)
-        if not isinstance(values, list) or not values or any(value not in normalized_providers for value in values):
-            raise WorkerError("relay configuration has invalid fallback policy")
-        normalized_fallback[name] = tuple(values)
-    normalized_timeouts: dict[str, int] = {}
-    for name in ("read_only_seconds", "write_seconds", "general_seconds"):
-        try:
-            value = int(timeouts.get(name))
-        except (TypeError, ValueError) as exc:
-            raise WorkerError("relay configuration has invalid timeout") from exc
-        if value < 30:
-            raise WorkerError("relay configuration timeout must be at least 30 seconds")
-        normalized_timeouts[name] = value
-    return {"providers": normalized_providers, "roles": normalized_roles, "fallback": normalized_fallback, "timeouts": normalized_timeouts}
+        return load_policy(path)
+    except RuntimeConfigError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 RUNTIME_CONFIG = load_runtime_config()
@@ -125,6 +105,11 @@ DEFAULT_GENERAL_TIMEOUT = RUNTIME_CONFIG["timeouts"]["general_seconds"]
 
 CIRCUIT_FAILURE_THRESHOLD = 2
 CIRCUIT_TTL_SECONDS = 30
+FINALIZATION_RESERVE_SECONDS = 15
+FINALIZATION_PROMPT = (
+    "Do not make any changes and do not use tools. Return only the required final JSON object for "
+    "the task you just completed, with exactly status, summary, files_changed, tests, and risks."
+)
 
 
 def _circuit_lock():
@@ -268,6 +253,27 @@ def redact(text: str, limit: int = 1200) -> str:
     return compact[-limit:]
 
 
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
+    return round(ordered[index], 2)
+
+
+def redact_summary(summary: str, workdir: Path) -> str:
+    """Keep model summaries useful while removing the task absolute workdir."""
+    replacements = {str(workdir), str(workdir.resolve()), os.path.realpath(str(workdir))}
+    if str(workdir).startswith("/private/"):
+        replacements.add(str(workdir)[len("/private"):])
+    elif str(workdir).startswith("/"):
+        replacements.add("/private" + str(workdir))
+    value = summary
+    for path in sorted(replacements, key=len, reverse=True):
+        value = value.replace(path, "[WORKDIR]")
+    return value[:4000]
+
+
 def load_task(task: str | None, task_file: str | None) -> str:
     if bool(task) == bool(task_file):
         raise WorkerError("provide exactly one of --task or --task-file")
@@ -286,54 +292,11 @@ def load_task(task: str | None, task_file: str | None) -> str:
 
 
 def normalize_role(role: str, task: str = "") -> str:
-    value = role.strip().lower().replace("_", "-")
-    if value != "auto":
-        return value
-    lowered = task.lower()
-    keyword_groups = [
-        (SOL_ROLES, ("architecture", "architect", "规划", "架构", "最终 review", "final review")),
-        (TERRA_ROLES, ("second opinion", "validation", "review", "复核", "验证", "审查")),
-        (READ_ONLY_ROLES, ("grep", "search", "explore", "日志分析", "代码搜索", "仓库探索")),
-        (WORKER_ROLES, ("implement", "test", "debug", "refactor", "document", "实现", "测试", "调试", "重构", "文档")),
-    ]
-    for roles, keywords in keyword_groups:
-        if any(word in lowered for word in keywords):
-            return sorted(roles)[0]
-    return "implementation"
+    return resolve_route(role, task, RUNTIME_CONFIG)["role"]
 
 
 def route(role: str, task: str = "") -> dict[str, Any]:
-    normalized = normalize_role(role, task)
-    if normalized in SOL_ROLES:
-        return {"target": "sol", "role": normalized, "reason": "architecture_or_final_decision"}
-    if normalized in TERRA_ROLES:
-        return {"target": "terra", "role": normalized, "reason": "review_or_validation"}
-    if normalized in READ_ONLY_ROLES:
-        return {
-            "target": "deepseek",
-            "role": normalized,
-            "provider": "sensenova1",
-            "profile": PROVIDERS["sensenova1"]["profile"],
-            "sandbox": "read-only",
-            "reason": "read_heavy_execution",
-        }
-    if normalized in WORKER_ROLES:
-        return {
-            "target": "deepseek",
-            "role": normalized,
-            "provider": "sensenova1",
-            "profile": PROVIDERS["sensenova1"]["profile"],
-            "sandbox": "workspace-write",
-            "reason": "execution_task",
-        }
-    return {
-        "target": "deepseek",
-        "role": normalized,
-        "provider": "sensenova1",
-        "profile": PROVIDERS["sensenova1"]["profile"],
-        "sandbox": "workspace-write",
-        "reason": "general_execution",
-    }
+    return resolve_route(role, task, RUNTIME_CONFIG)
 
 
 def workspace_snapshot(workdir: Path) -> dict[str, str]:
@@ -418,48 +381,40 @@ def workdir_lock(workdir: Path):
     return handle
 
 
+def provider_lease(provider: str):
+    """Acquire one local execution slot per upstream Provider without queueing callers."""
+    lock_path = PROVIDER_LOCK_ROOT / f"{provider}.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise WorkerError(f"provider {provider} is already executing another Relay task") from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({"provider": provider, "pid": os.getpid()}, separators=(",", ":")))
+    handle.flush()
+    return handle
+
+
 def changed_workspace_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
     return sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
 
 
 def build_provider_order(role: str, selected_provider: str, automatic: bool) -> list[str]:
     """Keep fallback traffic aligned with the task's read/write characteristics."""
-    if not automatic:
-        return [selected_provider]
-    normalized = normalize_role(role)
-    if normalized in READ_ONLY_ROLES:
-        preferred = RUNTIME_CONFIG["fallback"]["read_only"]
-    elif normalized in WORKER_ROLES:
-        preferred = RUNTIME_CONFIG["fallback"]["worker"]
-    else:
-        preferred = RUNTIME_CONFIG["fallback"]["general"]
-    return [selected_provider, *(name for name in preferred if name != selected_provider)]
+    return provider_order(role, selected_provider, automatic, RUNTIME_CONFIG)
 
 
 def provider_timeouts(total_timeout: int, attempts: int) -> list[int]:
     """Give the preferred route enough time to finish before bounded fallbacks."""
-    total = max(30, int(total_timeout))
-    if attempts <= 1:
-        return [total]
-    if total < 60:
-        base, remainder = divmod(total, attempts)
-        return [base + (1 if index < remainder else 0) for index in range(attempts)]
-    reserve = min(45, max(20, total // 4))
-    first = total - reserve
-    fallback, remainder = divmod(reserve, attempts - 1)
-    return [first, *(fallback + (1 if index < remainder else 0) for index in range(attempts - 1))]
+    return timeout_split(total_timeout, attempts)
 
 
 def effective_timeout(requested_timeout: int, role: str) -> int:
     """Use short role-aware defaults unless a caller explicitly supplies a positive budget."""
-    if requested_timeout > 0:
-        return max(30, int(requested_timeout))
-    normalized = normalize_role(role)
-    if normalized in READ_ONLY_ROLES:
-        return DEFAULT_READ_TIMEOUT
-    if normalized in WORKER_ROLES:
-        return DEFAULT_WRITE_TIMEOUT
-    return DEFAULT_GENERAL_TIMEOUT
+    return default_timeout(requested_timeout, role, RUNTIME_CONFIG)
 
 
 def worker_prompt(task: str, role: str) -> str:
@@ -499,26 +454,15 @@ Task:
 
 def adapter_command(provider: str, workdir: Path, role: str, sandbox: str, task: str) -> list[str]:
     """Build a bounded adapter invocation from the reviewed declarative Provider policy."""
-    metadata = PROVIDERS.get(provider)
-    if metadata is None:
-        raise WorkerError(f"unknown provider: {provider}")
-    if metadata.get("adapter") != "opencode":
-        raise WorkerError(f"unsupported provider adapter: {metadata.get('adapter')}")
-    return [
-        str(OPENCODE_PATH),
-        "run",
-        "--dir",
-        str(workdir),
-        "--agent",
-        "plan" if sandbox == "read-only" else "build",
-        "--model",
-        str(metadata["model"]),
-        "--format",
-        "json",
-        "--title",
-        f"deepseek-worker:{role}",
-        worker_prompt(task, role),
-    ]
+    try:
+        return task_command(OPENCODE_PATH, PROVIDERS.get(provider), workdir, role, sandbox, worker_prompt(task, role))
+    except AdapterConfigError as exc:
+        raise WorkerError(f"unknown provider: {provider}" if str(exc) == "unknown provider" else str(exc)) from exc
+
+
+def finalization_command(workdir: Path, session_id: str, sandbox: str) -> list[str]:
+    """Request the original OpenCode session's contract without replaying its task."""
+    return build_finalization_command(OPENCODE_PATH, workdir, session_id, sandbox, FINALIZATION_PROMPT)
 
 
 STATUS_ALIASES = {
@@ -664,6 +608,56 @@ def parse_opencode_events(stdout: str) -> tuple[dict[str, Any] | None, dict[str,
     return message, usage, bool(texts) and message is None, task_activity
 
 
+def opencode_session_id(stdout: str) -> str | None:
+    """Read one opaque OpenCode session identifier from raw events without retaining it."""
+    session_ids: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"sessionID", "sessionId", "session_id"} and isinstance(child, str):
+                    if re.fullmatch(r"[A-Za-z0-9_-]{8,200}", child):
+                        session_ids.add(child)
+                elif isinstance(child, (dict, list)):
+                    collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    for line in stdout.splitlines():
+        try:
+            collect(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return next(iter(session_ids)) if len(session_ids) == 1 else None
+
+
+def finalization_timeout(remaining_seconds: int) -> int:
+    """Use only time naturally left after an early stream terminal, never steal task runtime."""
+    return min(FINALIZATION_RESERVE_SECONDS, max(0, remaining_seconds))
+
+
+def initial_execution_timeout(allocated_seconds: int, sandbox: str, provider_count: int) -> int:
+    """Reserve a bounded contract-finalization window for one Provider.
+
+    The reserve is part of the caller's existing timeout, not extra wall-clock time. It is
+    unavailable to multi-Provider routes (where the allocation belongs to fallback policy). A
+    write may use the reserve only after its initial process exits naturally; this never replays
+    the write task or accepts a Worker-forced timeout as completed work.
+    """
+    if provider_count == 1 and allocated_seconds > FINALIZATION_RESERVE_SECONDS:
+        return allocated_seconds - FINALIZATION_RESERVE_SECONDS
+    return allocated_seconds
+
+
+def combined_usage(*values: dict[str, int]) -> dict[str, int]:
+    combined: dict[str, int] = {}
+    for value in values:
+        for key, amount in value.items():
+            combined[key] = combined.get(key, 0) + int(amount)
+    return combined
+
+
 def opencode_stream_diagnostics(stdout: str) -> dict[str, Any]:
     """Classify OpenCode's terminal stream without retaining model text or raw errors."""
     saw_opencode_event = False
@@ -692,25 +686,55 @@ def opencode_stream_diagnostics(stdout: str) -> dict[str, Any]:
             saw_error_event = True
 
     failure: str | None = None
+    failure_category: str | None = None
     last_reason = finish_reasons[-1] if finish_reasons else None
     if saw_opencode_event:
         if saw_error_event:
             failure = "OpenCode emitted an error event"
+            failure_category = "opencode_error_event"
         elif not saw_step_finish:
             failure = "OpenCode stream ended without a step_finish event"
+            failure_category = "missing_step_finish"
         elif last_reason is None:
             failure = "OpenCode step_finish did not include a reason"
+            failure_category = "missing_finish_reason"
         elif last_reason in {"length", "error", "unknown", "other"}:
             failure = f"OpenCode stream ended with finish reason {last_reason}"
+            failure_category = f"finish_reason:{last_reason}"
         elif not saw_usable_text:
             failure = "OpenCode stream ended with zero usable text output"
+            failure_category = "zero_usable_text"
     return {
         "is_opencode": saw_opencode_event,
         "saw_step_finish": saw_step_finish,
         "finish_reason": last_reason,
         "has_usable_text": saw_usable_text,
         "failure": failure,
+        "failure_category": failure_category,
     }
+
+
+def attempt_failure_category(
+    completed: subprocess.CompletedProcess[str],
+    stream: dict[str, Any],
+    message: dict[str, Any] | None,
+    invalid_result: bool,
+    task_activity: bool,
+    declared_mismatch: bool,
+) -> str:
+    """Return a bounded, non-sensitive classification for an unaccepted attempt."""
+    if declared_mismatch:
+        return "declared_diff_mismatch"
+    category = stream.get("failure_category")
+    if isinstance(category, str):
+        return category
+    if invalid_result or message is None:
+        return "invalid_structured_result"
+    if not task_activity:
+        return "no_task_tool_activity"
+    if completed.returncode != 0:
+        return "process_nonzero_exit"
+    return "unclassified_attempt_failure"
 
 
 def parse_worker_events(stdout: str) -> tuple[dict[str, Any] | None, dict[str, int], bool, bool]:
@@ -797,6 +821,44 @@ def write_native_canary_config(source: Path, destination: Path, agent_provider: 
     os.chmod(destination, 0o600)
 
 
+def native_role_layer_text(agent_type: str, provider: str, layer: str, source: Path | None = None) -> str | None:
+    """Render one isolated role layer without changing the user's registered agent files."""
+    if layer not in NATIVE_ROLE_LAYERS:
+        raise WorkerError(f"unsupported native role layer: {layer}")
+    if layer == "builtin":
+        return None
+    if layer == "full":
+        if source is None or not source.is_file():
+            raise WorkerError(f"native canary role not found: {agent_type}")
+        try:
+            return source.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise WorkerError(f"cannot read native canary role: {type(exc).__name__}") from exc
+    lines = [
+        f"name = {json.dumps(agent_type, ensure_ascii=False)}\n",
+        f"description = {json.dumps(f'isolated native {layer} canary role', ensure_ascii=False)}\n",
+    ]
+    if layer == "model-only":
+        lines.append('model = "deepseek-v4-flash"\n')
+    elif layer == "provider-only":
+        lines.append(f"model_provider = {json.dumps(provider)}\n")
+    return "".join(lines)
+
+
+def write_native_role_layer(destination: Path, agent_type: str, provider: str, layer: str, source: Path) -> bool:
+    """Write a disposable role definition and return whether the role is custom."""
+    rendered = native_role_layer_text(agent_type, provider, layer, source)
+    if rendered is None:
+        return False
+    try:
+        tomllib.loads(rendered)
+    except tomllib.TOMLDecodeError as exc:
+        raise WorkerError("native role layer became invalid TOML") from exc
+    destination.write_text(rendered, encoding="utf-8")
+    os.chmod(destination, 0o600)
+    return True
+
+
 def build_v1_canary_catalog(source: Path, output: Path, parent_model: str) -> None:
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
@@ -854,7 +916,11 @@ def build_cliproxy_canary_catalog(source: Path, output: Path, parent_model: str)
     os.chmod(output, 0o600)
 
 
-def native_v1_child_result(stdout: str, nonce: str) -> tuple[dict[str, Any] | None, str | None, bool, bool, bool]:
+def native_v1_child_result(
+    stdout: str,
+    nonce: str,
+    expected_summary: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None, bool, bool, bool]:
     spawned = waited = False
     child_result: dict[str, Any] | None = None
     child_ids: list[str] = []
@@ -894,7 +960,11 @@ def native_v1_child_result(stdout: str, nonce: str) -> tuple[dict[str, Any] | No
                 continue
             if is_valid_result(parsed):
                 child_result = parsed
-    expected_summaries = {f"native-v1-canary:{nonce}", f"cliproxy-native-canary:{nonce}"}
+    expected_summaries = (
+        {expected_summary}
+        if expected_summary is not None
+        else {f"native-v1-canary:{nonce}", f"cliproxy-native-canary:{nonce}"}
+    )
     nonce_verified = bool(child_result and child_result.get("summary") in expected_summaries)
     child_id = child_ids[0] if len(child_ids) == 1 else None
     spawned = spawned or bool(waited and child_id)
@@ -1124,6 +1194,10 @@ def native_v1_command(codex: Path, catalog: Path, parent_model: str, prompt: str
         "features.multi_agent=true",
         "-c",
         "features.multi_agent_v2=false",
+        "-c",
+        "features.remote_plugin=false",
+        "-c",
+        "features.plugins=false",
         "exec",
         "--skip-git-repo-check",
         "--sandbox",
@@ -1131,6 +1205,16 @@ def native_v1_command(codex: Path, catalog: Path, parent_model: str, prompt: str
         "--json",
         prompt,
     ]
+
+
+def native_v1_prompt(agent_type: str, child_task: str) -> str:
+    """Use the actual V1 wait tool name so the parent must return child evidence."""
+    return (
+        f"Use the native spawn_agent tool exactly once. Set agent_type to {agent_type} and fork_turns to none. "
+        f"Give it this task verbatim: <canary-task>{child_task}</canary-task> Then call wait_agent to wait for "
+        "that subagent's final status. Do not synthesize or repair the child response. Return the child's response "
+        "verbatim as your final response."
+    )
 
 
 def invoke_codex(
@@ -1178,41 +1262,30 @@ def invoke_codex(
     return result
 
 
-def record_run(payload: dict[str, Any], run_type: str = "external_run") -> None:
-    record = {
-        "timestamp": datetime.now(UTC).isoformat(),
-        "run_type": run_type,
-        "status": payload.get("status"),
-        "provider": payload.get("provider"),
-        "role": payload.get("role"),
-        "duration_seconds": payload.get("duration_seconds"),
-        "stream_finish_reason": payload.get("stream_finish_reason"),
-        "stream_retry_count": payload.get("stream_retry_count", 0),
-        "usage": payload.get("usage", {}),
-    }
-    RUN_LOG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    fd = os.open(RUN_LOG_PATH, flags, 0o600)
-    try:
-        os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode())
-    finally:
-        os.close(fd)
+def record_run(
+    payload: dict[str, Any],
+    run_type: str = "external_run",
+    telemetry_scope: str = "production",
+) -> None:
+    append_record(
+        RUN_LOG_PATH,
+        run_record(payload, VERSION, run_type, telemetry_scope, datetime.now(UTC).isoformat()),
+    )
 
 
 def job_paths(job_id: str) -> tuple[Path, Path, Path]:
     """Compatibility paths for a job's durable metadata and transient process output."""
-    if not job_id or any(char not in "0123456789abcdef-" for char in job_id):
-        raise WorkerError("invalid worker job id")
-    return (
-        JOB_ROOT / job_id / "meta.json",
-        JOB_ROOT / job_id / "stdout.jsonl",
-        JOB_ROOT / job_id / "stderr.log",
-    )
+    try:
+        return job_store().paths(job_id)
+    except ValueError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 def job_artifact_path(job_id: str, name: str) -> Path:
-    metadata_path, _stdout_path, _stderr_path = job_paths(job_id)
-    return metadata_path.parent / name
+    try:
+        return job_store().artifact_path(job_id, name)
+    except ValueError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 def job_state_for_payload(payload: dict[str, Any]) -> str:
@@ -1226,14 +1299,10 @@ def job_state_for_payload(payload: dict[str, Any]) -> str:
 
 
 def read_job_metadata(job_id: str) -> dict[str, Any]:
-    metadata_path, _stdout_path, _stderr_path = job_paths(job_id)
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkerError(f"worker job not found: {type(exc).__name__}") from exc
-    if not isinstance(metadata, dict) or metadata.get("job_id") != job_id:
-        raise WorkerError("invalid worker job metadata")
-    return metadata
+        return job_store().read_modern_metadata(job_id)
+    except ValueError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 def update_job_metadata(job_id: str, **updates: Any) -> dict[str, Any]:
@@ -1254,16 +1323,8 @@ def idempotency_digest(key: str | None) -> str | None:
 
 def find_idempotent_job(key_digest: str, workdir: Path) -> dict[str, Any] | None:
     """Return a prior job for the same opaque key and workdir without persisting key text."""
-    try:
-        directories = list(JOB_ROOT.iterdir())
-    except OSError:
-        return None
-    for directory in directories:
-        metadata_path = directory / "meta.json"
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
+    records, _invalid = job_store().modern_metadata()
+    for metadata in records:
         if (
             isinstance(metadata, dict)
             and metadata.get("idempotency_key_sha256") == key_digest
@@ -1283,13 +1344,7 @@ def idempotency_lock(key_digest: str):
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".worker-job-", delete=False) as handle:
-        json.dump(payload, handle, separators=(",", ":"))
-        handle.write("\n")
-        temporary = Path(handle.name)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    job_store().write_json(path, payload)
 
 
 def append_job_event(job_id: str, event: str, state: str, **details: Any) -> None:
@@ -1378,6 +1433,7 @@ def _launch_worker(args: argparse.Namespace) -> dict[str, Any]:
             }
     job_id = f"{int(time.time())}-{secrets.token_hex(6)}"
     metadata_path, stdout_path, stderr_path = job_paths(job_id)
+    telemetry_scope = getattr(args, "telemetry_scope", "production")
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -1393,6 +1449,8 @@ def _launch_worker(args: argparse.Namespace) -> dict[str, Any]:
         args.sandbox,
         "--timeout",
         str(args.timeout),
+        "--telemetry-scope",
+        telemetry_scope,
     ]
     if args.task_file:
         command.extend(("--task-file", str(Path(args.task_file).expanduser().resolve())))
@@ -1592,27 +1650,49 @@ def job_public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return {field: metadata[field] for field in fields if field in metadata}
 
 
+def legacy_job_public_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    """Expose only safe legacy facts; flat artifacts cannot be polled or resumed."""
+    metadata = record["metadata"]
+    return {
+        "job_id": record["job_id"],
+        "schema_version": 0,
+        "state": "legacy",
+        "created_at": metadata.get("started_at"),
+        "role": metadata.get("role") if isinstance(metadata.get("role"), str) else None,
+        "provider": metadata.get("provider") if isinstance(metadata.get("provider"), str) else None,
+        "legacy_action": "archive-only",
+    }
+
+
 def list_jobs(limit: int = 20) -> dict[str, Any]:
     if not 1 <= limit <= 100:
         raise WorkerError("job list limit must be between 1 and 100")
-    jobs: list[dict[str, Any]] = []
-    try:
-        directories = list(JOB_ROOT.iterdir())
-    except OSError:
-        directories = []
-    for directory in directories:
-        try:
-            metadata = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(metadata, dict) and isinstance(metadata.get("job_id"), str):
-            jobs.append(job_public_metadata(metadata))
+    modern, invalid_modern = job_store().modern_metadata()
+    legacy, invalid_legacy = job_store().legacy_metadata()
+    jobs = [job_public_metadata(metadata) for metadata in modern]
+    jobs.extend(legacy_job_public_metadata(record) for record in legacy)
     jobs.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
-    return {"status": "success", "jobs": jobs[:limit]}
+    return {
+        "status": "success",
+        "jobs": jobs[:limit],
+        "legacy": {"count": len(legacy), "action": "archive-only", "invalid_artifacts": invalid_legacy},
+        "invalid_modern_job_directories": invalid_modern,
+    }
 
 
 def inspect_job(job_id: str) -> dict[str, Any]:
-    metadata = read_job_metadata(job_id)
+    try:
+        metadata = read_job_metadata(job_id)
+    except WorkerError:
+        legacy, _invalid = job_store().legacy_metadata()
+        record = next((item for item in legacy if item["job_id"] == job_id), None)
+        if record is None:
+            raise
+        return {
+            "status": "success",
+            "job": legacy_job_public_metadata(record),
+            "legacy_note": "This pre-runtime artifact is read-only and cannot be polled, cancelled, or resumed.",
+        }
     payload: dict[str, Any] = {"status": "success", "job": job_public_metadata(metadata)}
     for artifact in ("before.json", "after.json", "result.json", "diagnostic.json"):
         try:
@@ -1628,6 +1708,87 @@ def inspect_job(job_id: str) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         pass
     return payload
+
+
+def terminal_job_finished_at(metadata: dict[str, Any]) -> datetime | None:
+    """Return a terminal timestamp only for a well-formed, finished job."""
+    if metadata.get("state") not in TERMINAL_JOB_STATES:
+        return None
+    try:
+        value = datetime.fromisoformat(str(metadata["finished_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def cleanup_terminal_jobs(retention_hours: float, apply: bool = False, legacy_action: str = "report") -> dict[str, Any]:
+    """Preview or remove expired modern jobs; legacy files need an explicit archive action."""
+    if not 0 <= retention_hours <= MAX_TERMINAL_JOB_RETENTION_HOURS:
+        raise WorkerError(f"retention hours must be between 0 and {MAX_TERMINAL_JOB_RETENTION_HOURS}")
+    if legacy_action not in {"report", "archive"}:
+        raise WorkerError("legacy action must be report or archive")
+    cutoff = datetime.now(UTC) - timedelta(hours=retention_hours)
+    candidates: list[str] = []
+    skipped = {"active": 0, "invalid": 0, "recent": 0, "legacy": 0}
+    modern, invalid_modern = job_store().modern_metadata()
+    legacy, invalid_legacy = job_store().legacy_metadata()
+    skipped["invalid"] = invalid_modern + invalid_legacy
+    skipped["legacy"] = len(legacy)
+    for metadata in modern:
+        finished_at = terminal_job_finished_at(metadata)
+        if finished_at is None:
+            skipped["active"] += 1
+            continue
+        if finished_at > cutoff:
+            skipped["recent"] += 1
+            continue
+        candidates.append(str(metadata["job_id"]))
+    removed: list[str] = []
+    if apply:
+        for job_id in candidates:
+            directory = JOB_ROOT / job_id
+            # Recheck before removal so a concurrent transition is never deleted.
+            try:
+                metadata = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                skipped["invalid"] += 1
+                continue
+            finished_at = terminal_job_finished_at(metadata) if isinstance(metadata, dict) and metadata.get("job_id") == job_id else None
+            if finished_at is None or finished_at > cutoff:
+                skipped["active"] += 1
+                continue
+            try:
+                shutil.rmtree(directory)
+                removed.append(job_id)
+            except OSError:
+                skipped["invalid"] += 1
+    archived_legacy_job_ids: list[str] = []
+    if legacy_action == "archive" and apply:
+        for record in legacy:
+            metadata = record["metadata"]
+            pid = metadata.get("pid")
+            if isinstance(pid, int) and process_is_running(pid):
+                skipped["active"] += 1
+                continue
+            try:
+                job_store().archive_legacy(record)
+                archived_legacy_job_ids.append(record["job_id"])
+            except (OSError, ValueError):
+                skipped["invalid"] += 1
+    return {
+        "status": "success",
+        "retention_hours": retention_hours,
+        "dry_run": not apply,
+        "candidate_job_ids": candidates,
+        "removed_job_ids": removed,
+        "legacy": {
+            "action": legacy_action,
+            "dry_run": not apply,
+            "candidate_job_ids": [record["job_id"] for record in legacy] if legacy_action == "archive" else [],
+            "archived_job_ids": archived_legacy_job_ids,
+        },
+        "skipped": skipped,
+    }
 
 
 def run_worker(args: argparse.Namespace) -> dict[str, Any]:
@@ -1667,9 +1828,11 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 "risks": ["provider circuit state is fail-open when its state file cannot be read or written"],
                 "usage": {},
                 "duration_seconds": 0.0,
+                "requested_provider": args.provider,
+                "fallback_attempted": False,
             }
             if not args.no_record:
-                record_run(payload, run_type="external_run")
+                record_run(payload, run_type="external_run", telemetry_scope=getattr(args, "telemetry_scope", "production"))
             return payload
     sandbox = args.sandbox if args.sandbox != "auto" else decision["sandbox"]
     lock_handle = None
@@ -1688,9 +1851,11 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 "risks": [str(exc)],
                 "usage": {},
                 "duration_seconds": 0.0,
+                "requested_provider": args.provider,
+                "fallback_attempted": False,
             }
             if not args.no_record:
-                record_run(payload, run_type="external_run")
+                record_run(payload, run_type="external_run", telemetry_scope=getattr(args, "telemetry_scope", "production"))
             return payload
     try:
         return _run_worker_locked(args, task, workdir, decision, selected_provider, provider_order, sandbox)
@@ -1720,81 +1885,155 @@ def _run_worker_locked(
     message: dict[str, Any] | None = None
     usage: dict[str, int] = {}
     total_usage: dict[str, int] = {}
+    accepted_usage: dict[str, int] = {}
     side_effect_attempt: dict[str, Any] | None = None
     accepted = False
     used_stream_retry = False
+    used_finalization_recovery = False
+    finalization_skip_reason: str | None = None
     last_stream = {"finish_reason": None, "failure": None}
     provider = selected_provider
     profile = PROVIDERS[provider]["profile"]
+    provider_busy = False
     for attempt_index, provider in enumerate(provider_order):
         profile = PROVIDERS[provider]["profile"]
-        command = adapter_command(provider, workdir, decision["role"], sandbox, task)
-        provider_deadline = time.monotonic() + attempt_timeouts[attempt_index]
-        stream_retry_count = 0
-        while True:
-            remaining_seconds = max(1, int(provider_deadline - time.monotonic()))
-            try:
-                completed = invoke_codex(
-                    command,
-                    workdir,
-                    remaining_seconds,
-                    env={**os.environ, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "131072"},
-                )
-            except FileNotFoundError as exc:
-                raise WorkerError("opencode command not found") from exc
-            message, usage, invalid_result, task_activity = parse_worker_events(completed.stdout)
-            stream = opencode_stream_diagnostics(completed.stdout)
-            last_stream = stream
-            for key, value in usage.items():
-                total_usage[key] = total_usage.get(key, 0) + value
-            attempt_snapshot = workspace_snapshot(workdir)
-            attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
-            current_snapshot = attempt_snapshot
-            declared_changes = set(message.get("files_changed", [])) if message is not None else set()
-            declared_mismatch = bool(message is not None and declared_changes != set(attempt_changes))
-            if (
-                completed.returncode == 0
-                and message is not None
-                and task_activity
-                and not declared_mismatch
-                and stream["failure"] is None
-            ):
-                accepted = True
-                break
-            attempt_label = provider if stream_retry_count == 0 else f"{provider} retry"
-            attempts.append(
-                {
-                    "provider": attempt_label,
-                    "error": (
-                        "declared files do not match the real workdir diff"
-                        if declared_mismatch
-                        else str(stream["failure"])
-                        if stream["failure"] is not None
-                        else "invalid structured worker result"
-                        if invalid_result or message is None
-                        else "no task tool activity"
-                        if not task_activity
-                        else redact(completed.stderr or completed.stdout, 300)
-                    ),
-                }
-            )
-            if attempt_changes:
-                side_effect_attempt = {"provider": provider, "files_changed": attempt_changes}
-                break
+        try:
+            lease_handle = provider_lease(provider)
+        except WorkerError as exc:
+            attempts.append({"provider": provider, "error": str(exc), "category": "provider_busy"})
+            provider_busy = True
             if automatic:
-                circuit_failure(provider)
-            retry_budget = int(provider_deadline - time.monotonic())
-            if stream["failure"] is not None and stream_retry_count == 0 and retry_budget >= 5:
-                stream_retry_count += 1
-                used_stream_retry = True
                 continue
             break
+        try:
+            command = adapter_command(provider, workdir, decision["role"], sandbox, task)
+            allocated_seconds = attempt_timeouts[attempt_index]
+            execution_seconds = initial_execution_timeout(allocated_seconds, sandbox, len(provider_order))
+            provider_deadline = time.monotonic() + execution_seconds
+            finalization_deadline = provider_deadline + (allocated_seconds - execution_seconds)
+            stream_retry_count = 0
+            while True:
+                remaining_seconds = max(1, int(provider_deadline - time.monotonic()))
+                try:
+                    completed = invoke_codex(
+                        command,
+                        workdir,
+                        remaining_seconds,
+                        env=execution_environment(os.environ, sandbox),
+                    )
+                except FileNotFoundError as exc:
+                    raise WorkerError("opencode command not found") from exc
+                message, usage, invalid_result, task_activity = parse_worker_events(completed.stdout)
+                stream = opencode_stream_diagnostics(completed.stdout)
+                last_stream = stream
+                attempt_snapshot = workspace_snapshot(workdir)
+                attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
+                session_id = opencode_session_id(completed.stdout)
+                recovered_finalization = False
+                recovered_usage: dict[str, int] | None = None
+                finalization_used_tools = False
+                finalization_changed_workspace = False
+                recovery_budget = finalization_timeout(int(finalization_deadline - time.monotonic()))
+                if message is None and task_activity and stream["failure"] is not None:
+                    if completed.returncode != 0 and not (sandbox == "read-only" and completed.returncode == 124):
+                        finalization_skip_reason = "process_exit"
+                    elif session_id is None:
+                        finalization_skip_reason = "session_unavailable"
+                    elif recovery_budget < 5:
+                        finalization_skip_reason = "budget_exhausted"
+                    else:
+                        try:
+                            recovery = invoke_codex(
+                                finalization_command(workdir, session_id, sandbox),
+                                workdir,
+                                recovery_budget,
+                                env=execution_environment(os.environ, sandbox),
+                            )
+                        except FileNotFoundError as exc:
+                            raise WorkerError("opencode command not found") from exc
+                        recovered_message, recovered_usage, recovered_invalid, recovered_activity = parse_worker_events(recovery.stdout)
+                        message = recovered_message
+                        usage = combined_usage(usage, recovered_usage)
+                        invalid_result = recovered_invalid
+                        finalization_used_tools = recovered_activity
+                        completed = recovery
+                        stream = opencode_stream_diagnostics(recovery.stdout)
+                        last_stream = stream
+                        before_finalization_snapshot = attempt_snapshot
+                        attempt_snapshot = workspace_snapshot(workdir)
+                        finalization_changed_workspace = bool(
+                            changed_workspace_paths(before_finalization_snapshot, attempt_snapshot)
+                        )
+                        attempt_changes = changed_workspace_paths(current_snapshot, attempt_snapshot)
+                        recovered_finalization = True
+                        used_finalization_recovery = True
+                for key, value in usage.items():
+                    total_usage[key] = total_usage.get(key, 0) + value
+                current_snapshot = attempt_snapshot
+                declared_changes = set(message.get("files_changed", [])) if message is not None else set()
+                declared_mismatch = bool(message is not None and declared_changes != set(attempt_changes))
+                if (
+                    completed.returncode == 0
+                    and message is not None
+                    and task_activity
+                    and not finalization_used_tools
+                    and not finalization_changed_workspace
+                    and not declared_mismatch
+                    and stream["failure"] is None
+                ):
+                    accepted = True
+                    if message.get("status") == "success":
+                        accepted_usage = dict(recovered_usage if recovered_usage is not None else usage)
+                    break
+                attempt_label = provider if stream_retry_count == 0 else f"{provider} retry"
+                category = (
+                    "finalization_used_tools"
+                    if finalization_used_tools
+                    else "finalization_changed_workspace"
+                    if finalization_changed_workspace
+                    else attempt_failure_category(completed, stream, message, invalid_result, task_activity, declared_mismatch)
+                )
+                attempts.append(
+                    {
+                        "provider": attempt_label,
+                        "category": category,
+                        "error": (
+                            "declared files do not match the real workdir diff"
+                            if declared_mismatch
+                            else "same-session finalization unexpectedly used a task tool"
+                            if finalization_used_tools
+                            else "same-session finalization changed the workspace"
+                            if finalization_changed_workspace
+                            else str(stream["failure"])
+                            if stream["failure"] is not None
+                            else "invalid structured worker result"
+                            if invalid_result or message is None
+                            else "no task tool activity"
+                            if not task_activity
+                            else redact(completed.stderr or completed.stdout, 300)
+                        ),
+                    }
+                )
+                if attempt_changes:
+                    side_effect_attempt = {"provider": provider, "files_changed": attempt_changes}
+                    break
+                if automatic:
+                    circuit_failure(provider)
+                retry_budget = int(provider_deadline - time.monotonic())
+                if stream["failure"] is not None and stream_retry_count == 0 and retry_budget >= 5:
+                    stream_retry_count += 1
+                    used_stream_retry = True
+                    continue
+                break
+        finally:
+            fcntl.flock(lease_handle.fileno(), fcntl.LOCK_UN)
+            lease_handle.close()
         if accepted or side_effect_attempt is not None:
             break
     duration = round(time.monotonic() - started, 2)
-    assert completed is not None
     after = workspace_snapshot(workdir)
     detected = changed_workspace_paths(before, after)
+    attempt_failure_categories = [str(item["category"]) for item in attempts if isinstance(item.get("category"), str)]
 
     if side_effect_attempt is not None and not accepted:
         payload = {
@@ -1810,25 +2049,33 @@ def _run_worker_locked(
                 f"{side_effect_attempt['provider']}: {attempts[-1]['error']}",
             ],
             "usage": total_usage,
+            "accepted_usage": accepted_usage,
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "finalization_recovery_count": 1 if used_finalization_recovery else 0,
+            "finalization_skip_reason": finalization_skip_reason,
+            "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
     elif not accepted:
         payload = {
-            "status": "error",
+            "status": "blocked" if provider_busy and all("already executing another Relay task" in item["error"] for item in attempts) else "error",
             "provider": provider,
             "profile": profile,
             "role": decision["role"],
-            "summary": "DeepSeek worker did not complete successfully.",
+            "summary": "All eligible DeepSeek providers are currently busy." if provider_busy and all("already executing another Relay task" in item["error"] for item in attempts) else "DeepSeek worker did not complete successfully.",
             "files_changed": detected,
             "tests": [],
             "risks": ["all DeepSeek providers failed", *[f"{item['provider']}: {item['error']}" for item in attempts]],
             "usage": total_usage,
+            "accepted_usage": accepted_usage,
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "finalization_recovery_count": 1 if used_finalization_recovery else 0,
+            "finalization_skip_reason": finalization_skip_reason,
+            "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
     else:
@@ -1837,22 +2084,28 @@ def _run_worker_locked(
             "provider": provider,
             "profile": profile,
             "role": decision["role"],
-            "summary": str(message.get("summary", ""))[:4000],
+            "summary": redact_summary(str(message.get("summary", "")), workdir),
             "files_changed": sorted(set(message.get("files_changed", [])) | set(detected)),
             "tests": list(message.get("tests", [])),
             "risks": list(message.get("risks", []))
             + (["bounded same-provider stream retry was used"] if used_stream_retry else [])
             + (["provider fallback was used after an earlier DeepSeek route failed"] if attempt_index > 0 else []),
             "usage": total_usage,
+            "accepted_usage": accepted_usage,
             "duration_seconds": duration,
             "stream_finish_reason": last_stream.get("finish_reason"),
             "stream_retry_count": 1 if used_stream_retry else 0,
+            "finalization_recovery_count": 1 if used_finalization_recovery else 0,
+            "finalization_skip_reason": finalization_skip_reason,
+            "attempt_failure_categories": attempt_failure_categories,
             "timeout_seconds": total_timeout,
         }
+    payload["requested_provider"] = args.provider
+    payload["fallback_attempted"] = automatic and provider != selected_provider
     if automatic and accepted:
         circuit_success(provider)
     if not args.no_record:
-        record_run(payload, run_type="external_run")
+        record_run(payload, run_type="external_run", telemetry_scope=getattr(args, "telemetry_scope", "production"))
     return payload
 
 
@@ -2042,11 +2295,19 @@ def native_smoke(agent_type: str, workdir: Path, timeout: int) -> dict[str, Any]
     }
 
 
-def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_override: str | None = None) -> dict[str, Any]:
+def native_v1_canary(
+    provider: str,
+    workdir: Path,
+    timeout: int,
+    parent_model_override: str | None = None,
+    role_layer: str = "full",
+) -> dict[str, Any]:
     agent_for_provider = {"sensenova": "explorer", "sensenova1": "worker", "opencode-go": "default"}
     agent_type = agent_for_provider.get(provider)
     if agent_type is None:
         raise WorkerError(f"unsupported native canary provider: {provider}")
+    if role_layer not in NATIVE_ROLE_LAYERS:
+        raise WorkerError(f"unsupported native role layer: {role_layer}")
     try:
         with CONFIG_PATH.open("rb") as handle:
             config = tomllib.load(handle)
@@ -2075,11 +2336,7 @@ def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_ov
         "Return exactly this JSON object with no Markdown or surrounding prose: "
         + json.dumps(child_contract, separators=(",", ":"))
     )
-    prompt = (
-        f"Use the native spawn_agent tool exactly once. Set agent_type to {agent_type} and fork_turns to none. "
-        f"Give it this task verbatim: <canary-task>{child_task}</canary-task> Then wait for that subagent. "
-        "Do not synthesize or repair the child response. Return the child's response verbatim as your final response."
-    )
+    prompt = native_v1_prompt(agent_type, child_task)
     config_before = file_fingerprint(CONFIG_PATH)
     state_before = state_db_snapshot()
     log_offset = BRIDGE_LOG_PATH.stat().st_size if BRIDGE_LOG_PATH.is_file() else 0
@@ -2092,9 +2349,7 @@ def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_ov
         isolated_workspace.mkdir()
         write_native_canary_config(CONFIG_PATH, isolated_home / "config.toml", provider)
         role_source = CODEX_HOME / "agents" / f"{agent_type}.toml"
-        if not role_source.is_file():
-            raise WorkerError(f"native canary role not found: {agent_type}")
-        shutil.copy2(role_source, isolated_agents / role_source.name)
+        custom_role = write_native_role_layer(isolated_agents / role_source.name, agent_type, provider, role_layer, role_source)
         for auth_name in ("auth.json", "current_account"):
             auth_source = CODEX_HOME / auth_name
             if auth_source.is_file():
@@ -2150,6 +2405,8 @@ def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_ov
         "root_model_provider": root_provider,
         "parent_model": parent_model,
         "agent_type": agent_type,
+        "role_layer": role_layer,
+        "custom_role": custom_role,
         "expected_provider": provider,
         "spawned": spawned,
         "waited": waited,
@@ -2163,6 +2420,190 @@ def native_v1_canary(provider: str, workdir: Path, timeout: int, parent_model_ov
         "errors": errors,
         "warnings": warnings,
         "diagnostics": diagnostics,
+    }
+
+
+def native_v1_tool_canary(
+    provider: str,
+    workdir: Path,
+    timeout: int,
+    parent_model_override: str | None = None,
+    role_layer: str = "full",
+) -> dict[str, Any]:
+    """Prove isolated V1 tool use and parent result transport; never promote production routing."""
+    agent_for_provider = {"sensenova": "explorer", "sensenova1": "worker", "opencode-go": "default"}
+    agent_type = agent_for_provider.get(provider)
+    if agent_type is None:
+        raise WorkerError(f"unsupported native tool canary provider: {provider}")
+    if role_layer not in NATIVE_ROLE_LAYERS:
+        raise WorkerError(f"unsupported native role layer: {role_layer}")
+    try:
+        with CONFIG_PATH.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise WorkerError(f"cannot read Codex config: {type(exc).__name__}") from exc
+    root_provider = str(config.get("model_provider", ""))
+    parent_model = parent_model_override or str(config.get("model", ""))
+    if root_provider != "openai-chatgpt":
+        raise WorkerError("native tool canary requires root model_provider=openai-chatgpt")
+    if not parent_model:
+        raise WorkerError("native tool canary requires a configured parent model")
+    catalog_source = Path(str(config.get("model_catalog_json", DEFAULT_CATALOG_PATH))).expanduser().resolve()
+    codex = desktop_codex_binary()
+    version_result = subprocess.run([str(codex), "--version"], text=True, capture_output=True, timeout=10, check=False)
+    desktop_version = version_result.stdout.strip() if version_result.returncode == 0 else "unknown"
+    nonce = secrets.token_hex(16)
+    config_before = file_fingerprint(CONFIG_PATH)
+    state_before = state_db_snapshot()
+    log_offset = BRIDGE_LOG_PATH.stat().st_size if BRIDGE_LOG_PATH.is_file() else 0
+    with tempfile.TemporaryDirectory(prefix="deepseek-native-v1-tool-") as temporary_dir:
+        temporary_root = Path(temporary_dir)
+        isolated_home = temporary_root / "codex-home"
+        isolated_agents = isolated_home / "agents"
+        isolated_workspace = temporary_root / "workspace"
+        isolated_agents.mkdir(parents=True)
+        isolated_workspace.mkdir()
+        hidden_a = secrets.token_hex(16)
+        hidden_b = secrets.token_hex(16)
+        (isolated_workspace / ".native-v1-canary-a").write_text(hidden_a, encoding="utf-8")
+        (isolated_workspace / ".native-v1-canary-b").write_text(hidden_b, encoding="utf-8")
+        expected_summary = f"native-v1-tool-canary:{hidden_a}:{hidden_b}"
+        child_contract_template = {
+            "status": "success",
+            "summary": "native-v1-tool-canary:<content-a>:<content-b>",
+            "files_changed": [],
+            "tests": ["parallel hidden tokens verified"],
+            "risks": [],
+        }
+        child_task = (
+            f"This is read-only native V1 tool canary run {nonce}. Two files named .native-v1-canary-a and "
+            ".native-v1-canary-b exist in your current working directory, but their contents are not in this task. "
+            "Use the shell tool to read them with exactly two independent commands in one parallel tool-use turn. "
+            "Do not modify files. Return exactly this JSON object with no Markdown or surrounding prose after "
+            "replacing the summary placeholders with both exact file contents: "
+            + json.dumps(child_contract_template, separators=(",", ":"))
+        )
+        prompt = native_v1_prompt(agent_type, child_task)
+        write_native_canary_config(CONFIG_PATH, isolated_home / "config.toml", provider)
+        role_source = CODEX_HOME / "agents" / f"{agent_type}.toml"
+        custom_role = write_native_role_layer(isolated_agents / role_source.name, agent_type, provider, role_layer, role_source)
+        for auth_name in ("auth.json", "current_account"):
+            auth_source = CODEX_HOME / auth_name
+            if auth_source.is_file():
+                (isolated_home / auth_name).symlink_to(auth_source)
+        catalog = temporary_root / "models.json"
+        build_v1_canary_catalog(catalog_source, catalog, parent_model)
+        command = native_v1_command(codex, catalog, parent_model, prompt)
+        isolated_env = dict(os.environ)
+        isolated_env["CODEX_HOME"] = str(isolated_home)
+        completed = invoke_codex(command, isolated_workspace, timeout, env=isolated_env)
+        child_result, child_id, spawned, waited, nonce_verified = native_v1_child_result(
+            completed.stdout,
+            nonce,
+            expected_summary,
+        )
+        child_metadata = native_child_metadata(isolated_home, child_id)
+        rollout_evidence = child_rollout_evidence(
+            isolated_home,
+            child_id,
+            nonce,
+            expected_summary=expected_summary,
+            expected_outputs=(hidden_a, hidden_b),
+        )
+        isolated_state_created = any(isolated_home.glob("state_*.sqlite"))
+    provider_completed = bridge_provider_completed(BRIDGE_LOG_PATH, log_offset, provider)
+    diagnostics = native_event_diagnostics(completed.stdout)
+    config_unchanged = config_before == file_fingerprint(CONFIG_PATH)
+    state_db_unchanged = state_before == state_db_snapshot()
+    metadata_valid = bool(
+        child_metadata
+        and child_metadata.get("model_provider") == provider
+        and child_metadata.get("model") == "deepseek-v4-flash"
+        and str(child_metadata.get("agent_role", "")).lower() == agent_type.lower()
+    )
+    errors: list[str] = []
+    warnings: list[str] = []
+    combined_output = completed.stdout + "\n" + completed.stderr
+    if completed.returncode != 0:
+        errors.append(redact(completed.stderr or completed.stdout, 300))
+    if "Unknown model" in combined_output:
+        errors.append("unknown model")
+    if not spawned:
+        errors.append("native V1 spawn event not completed")
+    if not waited:
+        errors.append("native V1 wait event not completed")
+    if child_result is None or not nonce_verified:
+        errors.append("wait event did not contain the assigned direct child result contract")
+    if not rollout_evidence["task_payload_present"]:
+        errors.append("child rollout did not contain the assigned task nonce")
+    if not rollout_evidence["tool_calls"] or rollout_evidence["tool_outputs"] < 2:
+        errors.append("child rollout did not contain both completed shell tool exchanges")
+    if not rollout_evidence["parallel_tool_calls_observed"]:
+        errors.append("child rollout did not show parallel shell tool calls")
+    if not rollout_evidence["expected_outputs_verified"]:
+        errors.append("child shell outputs did not contain both hidden challenge tokens")
+    if not rollout_evidence["final_result_valid"] or not rollout_evidence["final_result_nonce_verified"]:
+        errors.append("child rollout did not contain the assigned final result contract")
+    if not provider_completed:
+        errors.append(f"bridge did not record completion for {provider}")
+    if not metadata_valid:
+        errors.append("isolated state DB did not confirm the expected child provider/model/role")
+    if not isolated_state_created:
+        errors.append("native V1 tool canary did not create an isolated state DB")
+    if not config_unchanged:
+        errors.append("Codex config changed during canary")
+    if not state_db_unchanged:
+        warnings.append("live Codex state DB changed concurrently; canary child state was confined to temporary CODEX_HOME")
+    return {
+        "status": "success" if completed.returncode == 0 and not errors else "blocked",
+        "protocol": "v1-tool",
+        "desktop_codex_version": desktop_version,
+        "root_model_provider": root_provider,
+        "parent_model": parent_model,
+        "agent_type": agent_type,
+        "role_layer": role_layer,
+        "custom_role": custom_role,
+        "expected_provider": provider,
+        "spawned": spawned,
+        "waited": waited,
+        "child_result_valid": child_result is not None,
+        "nonce_verified": nonce_verified,
+        "task_payload_present": rollout_evidence["task_payload_present"],
+        "tool_calls": rollout_evidence["tool_calls"],
+        "tool_outputs": rollout_evidence["tool_outputs"],
+        "hidden_outputs_verified": rollout_evidence["expected_outputs_verified"],
+        "parallel_tool_calls_observed": rollout_evidence["parallel_tool_calls_observed"],
+        "rollout_final_result_valid": rollout_evidence["final_result_valid"],
+        "provider_completed": provider_completed,
+        "child_metadata_valid": metadata_valid,
+        "state_db_isolated": isolated_state_created,
+        "config_unchanged": config_unchanged,
+        "state_db_unchanged": state_db_unchanged,
+        "errors": errors,
+        "warnings": warnings,
+        "diagnostics": diagnostics,
+    }
+
+
+def native_role_bisection(provider: str, workdir: Path, timeout: int, parent_model_override: str | None = None) -> dict[str, Any]:
+    """Run explicit isolated role layers in order; this is research, never production routing."""
+    results: list[dict[str, Any]] = []
+    for layer in NATIVE_ROLE_LAYERS:
+        result = native_v1_canary(provider, workdir, timeout, parent_model_override, role_layer=layer)
+        results.append(result)
+        # The first failed layer is the bisection result; do not create extra Provider traffic.
+        if result.get("status") != "success":
+            break
+    first_failure = next((item.get("role_layer") for item in results if item.get("status") != "success"), None)
+    return {
+        "status": "success" if len(results) == len(NATIVE_ROLE_LAYERS) and all(item.get("status") == "success" for item in results) else "blocked",
+        "protocol": "v1-role-bisection",
+        "provider": provider,
+        "parent_model": parent_model_override,
+        "layers_attempted": [item["role_layer"] for item in results],
+        "first_failing_layer": first_failure,
+        "results": results,
+        "production_eligible": False,
     }
 
 
@@ -2440,15 +2881,49 @@ def stats(hours: float) -> dict[str, Any]:
     successes = sum(1 for row in rows if row.get("status") == "success")
     status_counts: dict[str, int] = {}
     by_provider: dict[str, int] = {}
+    by_requested_provider: dict[str, int] = {}
     by_run_type: dict[str, dict[str, Any]] = {}
     provider_stats: dict[str, dict[str, Any]] = {}
+    role_stats: dict[str, dict[str, Any]] = {}
     total_input = total_cached = total_cache_write = total_output = total_reasoning = 0
+    durations: list[float] = []
+    fallback_runs = partial_write_runs = stream_retry_runs = 0
+    finalization_skip_reasons: dict[str, int] = {}
+
+    def add_aggregate(detail: dict[str, Any], row: dict[str, Any], status: str, duration: float) -> None:
+        detail["runs"] += 1
+        detail["status_counts"][status] = detail["status_counts"].get(status, 0) + 1
+        detail["_durations"].append(duration)
+        detail["fallback_runs"] += int(bool(row.get("fallback_used")))
+        detail["partial_write_runs"] += int(bool(row.get("partial_write")))
+        detail["stream_retry_runs"] += int(int(row.get("stream_retry_count") or 0) > 0)
+
+    def aggregate() -> dict[str, Any]:
+        return {
+            "runs": 0,
+            "status_counts": {},
+            "_durations": [],
+            "fallback_runs": 0,
+            "partial_write_runs": 0,
+            "stream_retry_runs": 0,
+        }
+
     for row in rows:
         status = str(row.get("status", "unknown"))
         run_type = str(row.get("run_type", "external_run"))
         status_counts[status] = status_counts.get(status, 0) + 1
-        provider = str(row.get("provider", "unknown"))
+        provider = str(row.get("provider") or "unknown")
         by_provider[provider] = by_provider.get(provider, 0) + 1
+        requested_provider = str(row.get("requested_provider") or "unknown")
+        by_requested_provider[requested_provider] = by_requested_provider.get(requested_provider, 0) + 1
+        duration = float(row.get("duration_seconds") or 0)
+        durations.append(duration)
+        fallback_runs += int(bool(row.get("fallback_used")))
+        partial_write_runs += int(bool(row.get("partial_write")))
+        stream_retry_runs += int(int(row.get("stream_retry_count") or 0) > 0)
+        skip_reason = row.get("finalization_skip_reason")
+        if isinstance(skip_reason, str) and skip_reason:
+            finalization_skip_reasons[skip_reason] = finalization_skip_reasons.get(skip_reason, 0) + 1
         run_detail = by_run_type.setdefault(run_type, {"runs": 0, "successes": 0, "status_counts": {}})
         run_detail["runs"] += 1
         if status == "success":
@@ -2466,20 +2941,25 @@ def stats(hours: float) -> dict[str, Any]:
         total_output += output_tokens
         total_reasoning += reasoning_output_tokens
         detail = provider_stats.setdefault(provider, {
-            "runs": 0,
-            "status_counts": {},
+            **aggregate(),
             "success_rate_percent": 0.0,
             "duration_seconds": 0.0,
             "usage": {"input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0},
         })
-        detail["runs"] += 1
-        detail["status_counts"][status] = detail["status_counts"].get(status, 0) + 1
-        detail["duration_seconds"] += float(row.get("duration_seconds") or 0)
+        add_aggregate(detail, row, status, duration)
+        detail["duration_seconds"] += duration
+        role = str(row.get("role") or "unknown")
+        add_aggregate(role_stats.setdefault(role, aggregate()), row, status, duration)
         for key, value in (("input_tokens", input_tokens), ("cached_input_tokens", cached_input_tokens), ("cache_write_input_tokens", cache_write_input_tokens), ("output_tokens", output_tokens), ("reasoning_output_tokens", reasoning_output_tokens)):
             detail["usage"][key] += value
+    for detail in [*provider_stats.values(), *role_stats.values()]:
+        duration_values = detail.pop("_durations")
+        detail["p50_duration_seconds"] = percentile(duration_values, 0.5)
+        detail["p95_duration_seconds"] = percentile(duration_values, 0.95)
+        detail["success_rate_percent"] = round(100 * detail["status_counts"].get("success", 0) / detail["runs"], 2)
     for detail in provider_stats.values():
         detail["duration_seconds"] = round(detail["duration_seconds"], 2)
-        detail["success_rate_percent"] = round(100 * detail["status_counts"].get("success", 0) / detail["runs"], 2)
+    unknown_attribution = sum(1 for row in rows if not row.get("provider") or not row.get("role"))
     return {
         "status": "success",
         "window_hours": hours,
@@ -2487,9 +2967,24 @@ def stats(hours: float) -> dict[str, Any]:
         "successes": successes,
         "success_rate_percent": round(100 * successes / len(rows), 2) if rows else 0.0,
         "by_provider": by_provider,
+        "by_requested_provider": by_requested_provider,
         "by_run_type": by_run_type,
         "status_counts": status_counts,
         "provider_stats": provider_stats,
+        "role_stats": role_stats,
+        "reliability": {
+            "p50_duration_seconds": percentile(durations, 0.5),
+            "p95_duration_seconds": percentile(durations, 0.95),
+            "fallback_runs": fallback_runs,
+            "partial_write_runs": partial_write_runs,
+            "stream_retry_runs": stream_retry_runs,
+            "finalization_skip_reason_counts": dict(sorted(finalization_skip_reasons.items())),
+        },
+        "coverage_warnings": (
+            ["some run records lacked Provider or role attribution; those records are grouped under unknown"]
+            if unknown_attribution
+            else []
+        ),
         "circuit": circuit_summary(),
         "usage": {
             "input_tokens": total_input,
@@ -2531,6 +3026,26 @@ def parser() -> argparse.ArgumentParser:
     native_v1_parser.add_argument("--parent-model", help="Override the configured GPT parent for this isolated canary only.")
     native_v1_parser.add_argument("--workdir", default=str(Path.cwd()))
     native_v1_parser.add_argument("--timeout", type=int, default=180)
+    native_v1_parser.add_argument("--role-layer", choices=NATIVE_ROLE_LAYERS, default="full", help="Use one isolated role-definition layer; production remains external.")
+
+    native_v1_tool_parser = commands.add_parser(
+        "native-v1-tool-canary",
+        help="Run an isolated Desktop V1 canary that requires child shell tools, direct wait, and rollout evidence.",
+    )
+    native_v1_tool_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
+    native_v1_tool_parser.add_argument("--parent-model", help="Override the configured GPT parent for this isolated canary only.")
+    native_v1_tool_parser.add_argument("--workdir", default=str(Path.cwd()))
+    native_v1_tool_parser.add_argument("--timeout", type=int, default=180)
+    native_v1_tool_parser.add_argument("--role-layer", choices=NATIVE_ROLE_LAYERS, default="full", help="Use one isolated role-definition layer; production remains external.")
+
+    native_bisection_parser = commands.add_parser(
+        "native-role-bisection",
+        help="Explicitly bisect built-in, minimal, model-only, Provider-only, and full V1 role layers in disposable CODEX_HOME instances.",
+    )
+    native_bisection_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
+    native_bisection_parser.add_argument("--parent-model", help="Override the configured GPT parent for this isolated research matrix only.")
+    native_bisection_parser.add_argument("--workdir", default=str(Path.cwd()))
+    native_bisection_parser.add_argument("--timeout", type=int, default=180)
 
     cliproxy_parser = commands.add_parser(
         "cliproxy-native-canary",
@@ -2561,6 +3076,12 @@ def parser() -> argparse.ArgumentParser:
             "--idempotency-key",
             help="Opaque caller key (not retained in plaintext); reuses a matching job in the same workdir.",
         )
+        command_parser.add_argument(
+            "--telemetry-scope",
+            choices=("production", "diagnostic", "qualification"),
+            default="production",
+            help="Operational classification only; qualification normally uses --no-record.",
+        )
         command_parser.add_argument("--no-record", action="store_true")
 
     run_parser = commands.add_parser("run", help="Run one bounded execution task through a DeepSeek profile.")
@@ -2583,6 +3104,16 @@ def parser() -> argparse.ArgumentParser:
 
     inspect_parser = commands.add_parser("inspect", help="Inspect one durable job's metadata, manifests, and bounded result.")
     inspect_parser.add_argument("--job-id", required=True)
+
+    cleanup_parser = commands.add_parser("cleanup", help="Preview or remove expired terminal job artifacts; active jobs are always retained.")
+    cleanup_parser.add_argument("--retention-hours", type=float, default=DEFAULT_TERMINAL_JOB_RETENTION_HOURS)
+    cleanup_parser.add_argument("--apply", action="store_true", help="Actually delete eligible terminal job directories. Omit for a dry run.")
+    cleanup_parser.add_argument(
+        "--legacy-action",
+        choices=("report", "archive"),
+        default="report",
+        help="Keep flat legacy artifacts reported by default; archive moves them into a private legacy directory only with --apply.",
+    )
 
     smoke_parser = commands.add_parser("smoke-test", help="Run a tiny read-only live task through one provider.")
     smoke_parser.add_argument("--provider", choices=tuple(PROVIDERS), default="sensenova")
@@ -2609,19 +3140,31 @@ def main() -> int:
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = native_smoke(args.agent, workdir, args.timeout)
-            record_run(payload, run_type="native_smoke_test")
+            record_run(payload, run_type="native_smoke_test", telemetry_scope="diagnostic")
         elif args.command == "native-v1-canary":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
-            payload = native_v1_canary(args.provider, workdir, args.timeout, args.parent_model)
-            record_run(payload, run_type="native_v1_canary")
+            payload = native_v1_canary(args.provider, workdir, args.timeout, args.parent_model, args.role_layer)
+            record_run(payload, run_type="native_v1_canary", telemetry_scope="diagnostic")
+        elif args.command == "native-v1-tool-canary":
+            workdir = Path(args.workdir).expanduser().resolve()
+            if not workdir.is_dir():
+                raise WorkerError(f"workdir not found: {workdir}")
+            payload = native_v1_tool_canary(args.provider, workdir, args.timeout, args.parent_model, args.role_layer)
+            record_run(payload, run_type="native_v1_tool_canary", telemetry_scope="diagnostic")
+        elif args.command == "native-role-bisection":
+            workdir = Path(args.workdir).expanduser().resolve()
+            if not workdir.is_dir():
+                raise WorkerError(f"workdir not found: {workdir}")
+            payload = native_role_bisection(args.provider, workdir, args.timeout, args.parent_model)
+            record_run(payload, run_type="native_role_bisection", telemetry_scope="diagnostic")
         elif args.command == "cliproxy-native-canary":
             workdir = Path(args.workdir).expanduser().resolve()
             if not workdir.is_dir():
                 raise WorkerError(f"workdir not found: {workdir}")
             payload = cliproxy_native_canary(workdir, args.timeout, args.parent_model)
-            record_run(payload, run_type="cliproxy_native_canary")
+            record_run(payload, run_type="cliproxy_native_canary", telemetry_scope="diagnostic")
         elif args.command == "route":
             payload = {"status": "success", **route(args.role, args.task)}
         elif args.command == "run":
@@ -2638,6 +3181,8 @@ def main() -> int:
             payload = list_jobs(args.limit)
         elif args.command == "inspect":
             payload = inspect_job(args.job_id)
+        elif args.command == "cleanup":
+            payload = cleanup_terminal_jobs(args.retention_hours, args.apply, args.legacy_action)
         elif args.command == "smoke-test":
             run_args = argparse.Namespace(
                 task="Inspect the current directory without modifying files. Reply with a short success summary.",

@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,10 +19,26 @@ loader.exec_module(module)
 
 
 class RouterTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_dir = tempfile.TemporaryDirectory()
+        root = Path(self.runtime_dir.name)
+        self.patches = [
+            patch.object(module, "CIRCUIT_STATE_PATH", root / "circuit.json"),
+            patch.object(module, "CIRCUIT_LOCK_PATH", root / "circuit.lock"),
+            patch.object(module, "PROVIDER_LOCK_ROOT", root / "provider-locks"),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.runtime_dir.cleanup()
+
     def test_declarative_runtime_config_matches_current_production_policy(self):
         config = module.load_runtime_config(module.ROOT / "relay.toml")
-        self.assertEqual(config["fallback"]["read_only"], ("sensenova1", "sensenova"))
-        self.assertEqual(config["fallback"]["worker"], ("sensenova1", "sensenova"))
+        self.assertEqual(config["fallback"]["read_only"], ("sensenova",))
+        self.assertEqual(config["fallback"]["worker"], ("sensenova",))
         self.assertEqual(config["providers"]["sensenova1"]["adapter"], "opencode")
         self.assertEqual(config["timeouts"]["read_only_seconds"], 75)
 
@@ -33,13 +50,86 @@ class RouterTests(unittest.TestCase):
             with self.assertRaises(module.WorkerError):
                 module.load_runtime_config(path)
 
+    def test_native_role_layers_are_minimal_and_do_not_require_user_role_for_builtin(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            source = Path(temporary_dir) / "explorer.toml"
+            source.write_text('name = "explorer"\nmodel = "deepseek-v4-flash"\nmodel_provider = "sensenova"\n', encoding="utf-8")
+            self.assertIsNone(module.native_role_layer_text("explorer", "sensenova", "builtin", source))
+            minimal = tomllib.loads(module.native_role_layer_text("explorer", "sensenova", "minimal", source))
+            model_only = tomllib.loads(module.native_role_layer_text("explorer", "sensenova", "model-only", source))
+            provider_only = tomllib.loads(module.native_role_layer_text("explorer", "sensenova", "provider-only", source))
+            self.assertNotIn("model", minimal)
+            self.assertNotIn("model_provider", minimal)
+            self.assertEqual(model_only["model"], "deepseek-v4-flash")
+            self.assertEqual(provider_only["model_provider"], "sensenova")
+            self.assertEqual(module.native_role_layer_text("explorer", "sensenova", "full", source), source.read_text(encoding="utf-8"))
+
+    def test_native_role_bisection_stops_before_upstream_when_spawn_is_unavailable(self):
+        blocked = {
+            "status": "blocked", "role_layer": "builtin", "spawned": False,
+            "provider_completed": False, "errors": ["agent type is currently not available"],
+        }
+        with patch.object(module, "native_v1_canary", return_value=blocked) as canary:
+            payload = module.native_role_bisection("sensenova", Path.cwd(), 60, "gpt-5.6-sol")
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["layers_attempted"], ["builtin"])
+        self.assertEqual(payload["first_failing_layer"], "builtin")
+        self.assertFalse(payload["production_eligible"])
+        canary.assert_called_once_with("sensenova", Path.cwd(), 60, "gpt-5.6-sol", role_layer="builtin")
+
+    def test_native_role_bisection_continues_to_first_failing_custom_layer(self):
+        outcomes = [
+            {"status": "success", "role_layer": "builtin", "spawned": True},
+            {"status": "success", "role_layer": "minimal", "spawned": True},
+            {"status": "blocked", "role_layer": "model-only", "spawned": True},
+        ]
+        with patch.object(module, "native_v1_canary", side_effect=outcomes) as canary:
+            payload = module.native_role_bisection("sensenova", Path.cwd(), 60)
+        self.assertEqual(payload["layers_attempted"], ["builtin", "minimal", "model-only"])
+        self.assertEqual(payload["first_failing_layer"], "model-only")
+        self.assertEqual(canary.call_count, 3)
+
     def test_opencode_adapter_command_is_scoped_to_role_and_workdir(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             command = module.adapter_command("sensenova1", Path(temporary_dir), "repository-exploration", "read-only", "inspect only")
+        self.assertIn("--pure", command)
         self.assertEqual(command[0], str(module.OPENCODE_PATH))
         self.assertEqual(command[command.index("--dir") + 1], temporary_dir)
-        self.assertEqual(command[command.index("--agent") + 1], "plan")
+        self.assertEqual(command[command.index("--agent") + 1], "relay-readonly")
         self.assertEqual(command[command.index("--model") + 1], "sensenova1/deepseek-v4-flash")
+
+    def test_finalization_command_reuses_session_and_preserves_role_sandbox(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            command = module.finalization_command(Path(temporary_dir), "session_abcdefgh", "read-only")
+        self.assertIn("--pure", command)
+        self.assertEqual(command[command.index("--session") + 1], "session_abcdefgh")
+        self.assertEqual(command[command.index("--agent") + 1], "relay-readonly")
+        self.assertIn("Do not make any changes", command[-1])
+        self.assertEqual(module.finalization_timeout(60), 15)
+        self.assertEqual(module.finalization_timeout(4), 4)
+
+    def test_relay_execution_environment_preserves_provider_overrides_and_uses_minimal_agents(self):
+        original = {"OPENCODE_CONFIG_CONTENT": json.dumps({"provider": {"private": {"models": {}}}})}
+        environment = module.execution_environment(original, "read-only")
+        overlay = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
+        self.assertIn("private", overlay["provider"])
+        self.assertEqual(environment["OPENCODE_DISABLE_PROJECT_CONFIG"], "true")
+        self.assertEqual(environment["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"], "131072")
+        self.assertEqual(overlay["subagent_depth"], 0)
+        self.assertEqual(overlay["agent"]["relay-readonly"]["permission"]["*"], "deny")
+        self.assertEqual(overlay["agent"]["relay-readonly"]["permission"]["read"], "allow")
+        self.assertEqual(overlay["agent"]["relay-workspace-write"]["permission"]["edit"], "allow")
+        self.assertEqual(overlay["agent"]["relay-workspace-write"]["permission"]["bash"], "allow")
+
+    def test_invalid_existing_inline_config_does_not_block_relay_agent_overlay(self):
+        environment = module.execution_environment({"OPENCODE_CONFIG_CONTENT": "not-json"}, "workspace-write")
+        overlay = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(overlay["agent"]["relay-workspace-write"]["mode"], "primary")
+
+    def test_single_provider_reserves_finalization_budget_without_extending_timeout(self):
+        self.assertEqual(module.initial_execution_timeout(75, "read-only", 1), 60)
+        self.assertEqual(module.initial_execution_timeout(120, "workspace-write", 1), 105)
+        self.assertEqual(module.initial_execution_timeout(75, "read-only", 2), 75)
 
     def test_invoke_codex_closes_stdin(self):
         class DummyProcess:
@@ -110,6 +200,8 @@ class RouterTests(unittest.TestCase):
             with patch.object(module, "JOB_ROOT", Path(jobs)), patch.object(module, "workspace_snapshot", return_value={}), patch.object(module.secrets, "token_hex", return_value="abcdef123456"), patch.object(module.subprocess, "Popen", return_value=DummyProcess()) as popen:
                 launched = module.launch_worker(args)
                 self.assertEqual(launched["status"], "running")
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--telemetry-scope") + 1], "production")
                 self.assertEqual(popen.call_args.kwargs["stdin"], module.subprocess.DEVNULL)
                 job_id = launched["job_id"]
                 metadata, stdout, _stderr = module.job_paths(job_id)
@@ -189,6 +281,85 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(inspected["result"]["status"], "success")
             self.assertNotIn("events", inspected)
 
+    def test_cleanup_previews_only_old_terminal_jobs_and_keeps_active_or_invalid_jobs(self):
+        with tempfile.TemporaryDirectory() as jobs:
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                old_id = "1700000000-abcdef123456"
+                recent_id = "1700000001-abcdef123457"
+                active_id = "1700000002-abcdef123458"
+                old_finished = (module.datetime.now(module.UTC) - module.timedelta(hours=169)).isoformat()
+                recent_finished = (module.datetime.now(module.UTC) - module.timedelta(hours=1)).isoformat()
+                for job_id, state, finished_at in ((old_id, "succeeded", old_finished), (recent_id, "failed", recent_finished), (active_id, "running", None)):
+                    metadata, _stdout, _stderr = module.job_paths(job_id)
+                    data = {"schema_version": 1, "job_id": job_id, "state": state}
+                    if finished_at:
+                        data["finished_at"] = finished_at
+                    module.write_json(metadata, data)
+                invalid = Path(jobs) / "invalid-job"
+                invalid.mkdir()
+                (invalid / "meta.json").write_text("not json", encoding="utf-8")
+
+                preview = module.cleanup_terminal_jobs(168)
+                self.assertTrue(preview["dry_run"])
+                self.assertEqual(preview["candidate_job_ids"], [old_id])
+                self.assertTrue((Path(jobs) / old_id).is_dir())
+                self.assertGreaterEqual(preview["skipped"]["active"], 1)
+                self.assertGreaterEqual(preview["skipped"]["invalid"], 1)
+
+                applied = module.cleanup_terminal_jobs(168, apply=True)
+                self.assertFalse(applied["dry_run"])
+                self.assertEqual(applied["removed_job_ids"], [old_id])
+                self.assertFalse((Path(jobs) / old_id).exists())
+                self.assertTrue((Path(jobs) / recent_id).is_dir())
+                self.assertTrue((Path(jobs) / active_id).is_dir())
+
+    def test_cleanup_rejects_unbounded_retention(self):
+        with self.assertRaises(module.WorkerError):
+            module.cleanup_terminal_jobs(-1)
+        with self.assertRaises(module.WorkerError):
+            module.cleanup_terminal_jobs(module.MAX_TERMINAL_JOB_RETENTION_HOURS + 1)
+
+    def test_legacy_flat_artifacts_are_visible_but_not_treated_as_runnable_jobs(self):
+        with tempfile.TemporaryDirectory() as jobs:
+            legacy_id = "1700000000-abcdef123456"
+            legacy_path = Path(jobs) / f"{legacy_id}.json"
+            legacy_path.write_text(json.dumps({
+                "job_id": legacy_id,
+                "pid": 999999,
+                "started_at": "2026-08-01T00:00:00+00:00",
+                "role": "repository-exploration",
+                "provider": "sensenova",
+                "workdir": "/private/legacy-workdir",
+                "task": "must not escape list output",
+            }), encoding="utf-8")
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                listed = module.list_jobs()
+                inspected = module.inspect_job(legacy_id)
+                cleanup = module.cleanup_terminal_jobs(0)
+            rendered = json.dumps({"listed": listed, "inspected": inspected, "cleanup": cleanup})
+            self.assertEqual(listed["legacy"]["count"], 1)
+            self.assertEqual(listed["jobs"][0]["state"], "legacy")
+            self.assertEqual(inspected["job"]["legacy_action"], "archive-only")
+            self.assertEqual(cleanup["skipped"]["legacy"], 1)
+            self.assertNotIn("/private/legacy-workdir", rendered)
+            self.assertNotIn("must not escape", rendered)
+            self.assertFalse((Path(jobs) / "legacy").exists())
+
+    def test_legacy_archive_requires_explicit_action_and_apply(self):
+        with tempfile.TemporaryDirectory() as jobs:
+            legacy_id = "1700000000-abcdef123456"
+            legacy_path = Path(jobs) / f"{legacy_id}.json"
+            legacy_path.write_text(json.dumps({"job_id": legacy_id, "pid": 999999}), encoding="utf-8")
+            with patch.object(module, "JOB_ROOT", Path(jobs)):
+                dry_run = module.cleanup_terminal_jobs(0, legacy_action="archive")
+                self.assertTrue((Path(jobs) / f"{legacy_id}.json").is_file())
+                with patch.object(module, "process_is_running", return_value=False):
+                    applied = module.cleanup_terminal_jobs(0, apply=True, legacy_action="archive")
+            self.assertEqual(dry_run["legacy"]["candidate_job_ids"], [legacy_id])
+            self.assertEqual(applied["legacy"]["archived_job_ids"], [legacy_id])
+            self.assertFalse((Path(jobs) / f"{legacy_id}.json").exists())
+            self.assertTrue((Path(jobs) / "legacy" / f"{legacy_id}.json").is_file())
+
     def test_cancel_marks_job_without_replaying_and_preserves_changes(self):
         with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as jobs:
             job_id = "1700000000-abcdef123456"
@@ -267,12 +438,12 @@ class RouterTests(unittest.TestCase):
 
     def test_explorer_route(self):
         result = module.route("repository-exploration")
-        self.assertEqual(result["provider"], "sensenova1")
+        self.assertEqual(result["provider"], module.RUNTIME_CONFIG["fallback"]["read_only"][0])
         self.assertEqual(result["sandbox"], "read-only")
 
     def test_worker_route(self):
         result = module.route("implementation")
-        self.assertEqual(result["provider"], "sensenova1")
+        self.assertEqual(result["provider"], module.RUNTIME_CONFIG["fallback"]["worker"][0])
         self.assertEqual(result["sandbox"], "workspace-write")
 
     def test_worker_prompt_contains_literal_result_contract(self):
@@ -312,6 +483,23 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["status"], "error")
         self.assertTrue(any("declared files do not match" in risk for risk in payload["risks"]))
 
+    def test_accepted_summary_redacts_absolute_workdir(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            workdir = Path(temporary_dir)
+            response = json.dumps({"status": "success", "summary": f"Inspected {workdir} successfully", "files_changed": [], "tests": [], "risks": []})
+            events = "\n".join(map(json.dumps, [
+                {"type": "tool_use", "part": {"state": {"status": "completed"}}},
+                {"type": "text", "part": {"text": response}},
+                {"type": "step_finish", "part": {"reason": "stop"}},
+            ]))
+            completed = module.subprocess.CompletedProcess([], 0, events, "")
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=str(workdir), provider="sensenova1", sandbox="read-only", timeout=90, no_record=True)
+            with patch.object(module, "invoke_codex", return_value=completed):
+                payload = module.run_worker(args)
+        self.assertEqual(payload["status"], "success")
+        self.assertNotIn(str(workdir), payload["summary"])
+        self.assertIn("[WORKDIR]", payload["summary"])
+
     def test_non_git_workdir_snapshot_detects_file_changes(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             workdir = Path(temporary_dir)
@@ -325,17 +513,17 @@ class RouterTests(unittest.TestCase):
     def test_auto_route(self):
         self.assertEqual(module.route("auto", "debug a failing test")["target"], "deepseek")
 
-    def test_general_route_uses_sensenova1(self):
-        self.assertEqual(module.route("general-execution")["provider"], "sensenova1")
+    def test_general_route_uses_declared_primary_provider(self):
+        self.assertEqual(module.route("general-execution")["provider"], "sensenova")
 
     def test_auto_provider_order_is_role_specific(self):
         self.assertEqual(
-            module.build_provider_order("repository-exploration", "sensenova1", True),
-            ["sensenova1", "sensenova"],
+            module.build_provider_order("repository-exploration", "sensenova", True),
+            ["sensenova"],
         )
         self.assertEqual(
-            module.build_provider_order("implementation", "sensenova1", True),
-            ["sensenova1", "sensenova"],
+            module.build_provider_order("implementation", "sensenova", True),
+            ["sensenova"],
         )
 
     def test_circuit_breaker_persists_across_calls_and_explicit_provider_bypasses(self):
@@ -388,17 +576,59 @@ class RouterTests(unittest.TestCase):
             log = Path(temporary_dir) / "runs.jsonl"
             base_time = module.datetime.now(module.UTC).replace(microsecond=0)
             log.write_text("\n".join([
-                json.dumps({"timestamp": base_time.isoformat(), "run_type": "external_run", "status": "success", "provider": "sensenova", "duration_seconds": 10, "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
-                json.dumps({"timestamp": (base_time - module.timedelta(minutes=1)).isoformat(), "run_type": "native_v1_canary", "status": "partial", "provider": "sensenova1", "duration_seconds": 20, "usage": {"input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 2}}),
-                json.dumps({"timestamp": (base_time - module.timedelta(minutes=2)).isoformat(), "run_type": "external_run", "status": "error", "provider": "sensenova1", "duration_seconds": 30, "usage": {"input_tokens": 30, "cached_input_tokens": 6, "output_tokens": 5, "reasoning_output_tokens": 3}}),
+                json.dumps({"timestamp": base_time.isoformat(), "run_type": "external_run", "status": "success", "provider": "sensenova", "requested_provider": "auto", "role": "repository-exploration", "duration_seconds": 10, "fallback_used": False, "partial_write": False, "stream_retry_count": 0, "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
+                json.dumps({"timestamp": (base_time - module.timedelta(minutes=1)).isoformat(), "run_type": "native_v1_canary", "status": "partial", "provider": "sensenova1", "requested_provider": "sensenova1", "role": "implementation", "duration_seconds": 20, "fallback_used": False, "partial_write": True, "stream_retry_count": 1, "usage": {"input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 4, "reasoning_output_tokens": 2}}),
+                json.dumps({"timestamp": (base_time - module.timedelta(minutes=2)).isoformat(), "run_type": "external_run", "status": "error", "provider": "sensenova1", "requested_provider": "auto", "role": "implementation", "duration_seconds": 30, "fallback_used": True, "partial_write": False, "stream_retry_count": 0, "usage": {"input_tokens": 30, "cached_input_tokens": 6, "output_tokens": 5, "reasoning_output_tokens": 3}}),
             ]) + "\n")
             with patch.object(module, "RUN_LOG_PATH", log):
                 payload = module.stats(2)
         self.assertEqual(payload["status_counts"], {"success": 1, "partial": 1, "error": 1})
+        self.assertEqual(payload["by_requested_provider"], {"auto": 2, "sensenova1": 1})
         self.assertEqual(payload["usage"]["cached_input_tokens"], 15)
         self.assertEqual(payload["provider_stats"]["sensenova1"]["success_rate_percent"], 0.0)
         self.assertEqual(payload["by_run_type"]["external_run"]["runs"], 2)
         self.assertEqual(payload["by_run_type"]["native_v1_canary"]["runs"], 1)
+        self.assertEqual(payload["role_stats"]["implementation"]["runs"], 2)
+        self.assertEqual(payload["reliability"]["p50_duration_seconds"], 20.0)
+        self.assertEqual(payload["reliability"]["p95_duration_seconds"], 30.0)
+        self.assertEqual(payload["reliability"]["fallback_runs"], 1)
+        self.assertEqual(payload["reliability"]["partial_write_runs"], 1)
+        self.assertEqual(payload["reliability"]["stream_retry_runs"], 1)
+        self.assertEqual(payload["coverage_warnings"], [])
+
+    def test_stats_warns_and_normalizes_missing_attribution(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            log = Path(temporary_dir) / "runs.jsonl"
+            timestamp = module.datetime.now(module.UTC).isoformat()
+            record = {
+                "timestamp": timestamp,
+                "run_type": "native_v1_canary",
+                "status": "blocked",
+                "provider": None,
+                "role": None,
+                "duration_seconds": 0,
+                "usage": {},
+            }
+            log.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with patch.object(module, "RUN_LOG_PATH", log):
+                payload = module.stats(1)
+        self.assertIn("unknown", payload["by_provider"])
+        self.assertIn("unknown", payload["role_stats"])
+        self.assertEqual(len(payload["coverage_warnings"]), 1)
+
+    def test_record_run_attributes_native_diagnostics_from_expected_fields(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            log = Path(temporary_dir) / "runs.jsonl"
+            with patch.object(module, "RUN_LOG_PATH", log):
+                module.record_run(
+                    {"status": "blocked", "expected_provider": "sensenova", "agent_type": "explorer"},
+                    run_type="native_v1_tool_canary",
+                    telemetry_scope="diagnostic",
+                )
+            record = json.loads(log.read_text(encoding="utf-8"))
+        self.assertEqual(record["provider"], "sensenova")
+        self.assertEqual(record["role"], "explorer")
+        self.assertEqual(record["telemetry_scope"], "diagnostic")
 
     def test_catalog_default_is_not_global_config(self):
         self.assertNotEqual(module.DEFAULT_CATALOG_PATH, module.CONFIG_PATH)
@@ -482,6 +712,25 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(module.opencode_stream_diagnostics(length)["failure"], "OpenCode stream ended with finish reason length")
         self.assertEqual(module.opencode_stream_diagnostics(missing_finish)["failure"], "OpenCode stream ended without a step_finish event")
         self.assertEqual(module.opencode_stream_diagnostics(no_text)["failure"], "OpenCode stream ended with zero usable text output")
+
+    def test_opencode_stream_diagnostics_exposes_only_bounded_failure_categories(self):
+        error = json.dumps({"type": "error", "part": {}})
+        missing_finish = json.dumps({"type": "text", "part": {"text": "partial"}})
+        length = json.dumps({"type": "step_finish", "part": {"reason": "length"}})
+        self.assertEqual(module.opencode_stream_diagnostics(error)["failure_category"], "opencode_error_event")
+        self.assertEqual(module.opencode_stream_diagnostics(missing_finish)["failure_category"], "missing_step_finish")
+        self.assertEqual(module.opencode_stream_diagnostics(length)["failure_category"], "finish_reason:length")
+
+    def test_attempt_failure_category_prefers_safety_and_stream_classifications(self):
+        completed = module.subprocess.CompletedProcess([], 1, "", "raw sensitive error")
+        self.assertEqual(
+            module.attempt_failure_category(completed, {"failure_category": "opencode_error_event"}, None, True, False, False),
+            "opencode_error_event",
+        )
+        self.assertEqual(
+            module.attempt_failure_category(completed, {"failure_category": None}, None, True, False, True),
+            "declared_diff_mismatch",
+        )
 
     def test_native_contract_rejects_opening_prose(self):
         stdout = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "我会先检查目录。"}}) + "\n"
@@ -665,6 +914,28 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(waited)
         self.assertFalse(verified)
 
+    def test_native_v1_result_accepts_explicit_tool_canary_summary(self):
+        nonce = "abc123"
+        summary = "native-v1-tool-canary:token-a:token-b"
+        contract = {"status": "success", "summary": summary, "files_changed": [], "tests": [], "risks": []}
+        event = {"type": "item.completed", "item": {"type": "collab_tool_call", "tool": "wait", "status": "completed", "agents_states": {"child": {"message": contract}}}}
+        result, child_id, spawned, waited, verified = module.native_v1_child_result(json.dumps(event), nonce, summary)
+        self.assertEqual(result, contract)
+        self.assertEqual(child_id, "child")
+        self.assertTrue(spawned)
+        self.assertTrue(waited)
+        self.assertTrue(verified)
+
+    def test_native_v1_result_rejects_wrong_explicit_tool_canary_summary(self):
+        nonce = "abc123"
+        contract = {"status": "success", "summary": "native-v1-tool-canary:wrong", "files_changed": [], "tests": [], "risks": []}
+        event = {"type": "item.completed", "item": {"type": "collab_tool_call", "tool": "wait", "status": "completed", "agents_states": {"child": {"message": contract}}}}
+        _result, _child_id, _spawned, waited, verified = module.native_v1_child_result(
+            json.dumps(event), nonce, "native-v1-tool-canary:expected-a:expected-b"
+        )
+        self.assertTrue(waited)
+        self.assertFalse(verified)
+
     def test_native_result_recovers_child_id_from_v2_wait_state(self):
         nonce = "v2nonce"
         contract = {"status": "success", "summary": f"native-v1-canary:{nonce}", "files_changed": [], "tests": [], "risks": []}
@@ -707,7 +978,15 @@ class RouterTests(unittest.TestCase):
         self.assertIn('model_provider="openai-chatgpt"', command)
         self.assertIn("features.multi_agent=true", command)
         self.assertIn("features.multi_agent_v2=false", command)
+        self.assertIn("features.remote_plugin=false", command)
+        self.assertIn("features.plugins=false", command)
         self.assertEqual(command[0], "/desktop/codex")
+
+    def test_native_v1_prompt_requires_actual_wait_agent_tool(self):
+        prompt = module.native_v1_prompt("explorer", "child payload")
+        self.assertIn("call wait_agent", prompt)
+        self.assertIn("agent_type to explorer", prompt)
+        self.assertIn("<canary-task>child payload</canary-task>", prompt)
 
     def test_invalid_result_uses_next_auto_provider(self):
         invalid = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Starting work."}}) + "\n"
@@ -733,14 +1012,37 @@ class RouterTests(unittest.TestCase):
                 timeout=90,
                 no_record=True,
             )
-            with patch.object(module, "invoke_codex", side_effect=results) as invoke, \
+            fallback_config = {**module.RUNTIME_CONFIG, "fallback": {**module.RUNTIME_CONFIG["fallback"], "read_only": ("sensenova", "sensenova1")}}
+            with patch.object(module, "RUNTIME_CONFIG", fallback_config), \
+                 patch.object(module, "invoke_codex", side_effect=results) as invoke, \
                  patch.object(module, "CIRCUIT_STATE_PATH", Path(circuit_dir) / "circuit.json"), \
                  patch.object(module, "CIRCUIT_LOCK_PATH", Path(circuit_dir) / "circuit.lock"):
                 payload = module.run_worker(args)
         self.assertEqual(invoke.call_count, 2)
-        self.assertIn("sensenova/deepseek-v4-flash", invoke.call_args_list[1].args[0])
-        self.assertEqual(payload["provider"], "sensenova")
+        fallback = ("sensenova", "sensenova1")
+        self.assertIn(f"{fallback[1]}/deepseek-v4-flash", invoke.call_args_list[1].args[0])
+        self.assertEqual(payload["provider"], fallback[1])
         self.assertIn("provider fallback was used after an earlier DeepSeek route failed", payload["risks"])
+
+    def test_explicit_busy_provider_returns_fast_blocked_terminal(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(
+                task="inspect files",
+                task_file=None,
+                role="repository-exploration",
+                workdir=workdir,
+                provider="sensenova",
+                sandbox="read-only",
+                timeout=90,
+                no_record=True,
+            )
+            with patch.object(module, "provider_lease", side_effect=module.WorkerError("provider sensenova is already executing another Relay task")), \
+                 patch.object(module, "invoke_codex") as invoke:
+                payload = module.run_worker(args)
+        invoke.assert_not_called()
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["files_changed"], [])
+        self.assertIn("currently busy", payload["summary"])
 
     def test_length_finish_retries_same_provider_once_with_output_limit(self):
         truncated = "\n".join(map(json.dumps, [
@@ -765,10 +1067,161 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(invoke.call_count, 2)
         self.assertEqual(invoke.call_args_list[0].args[0], invoke.call_args_list[1].args[0])
         self.assertEqual(invoke.call_args_list[0].kwargs["env"]["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"], "131072")
+        self.assertEqual(invoke.call_args_list[0].kwargs["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"], "true")
         self.assertEqual(payload["status"], "success")
         self.assertIn("bounded same-provider stream retry was used", payload["risks"])
         self.assertEqual(payload["stream_finish_reason"], "stop")
         self.assertEqual(payload["stream_retry_count"], 1)
+
+    def test_no_text_stream_recovers_contract_in_same_session_without_replaying_task(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop", "tokens": {"input": 10, "output": 3}}},
+        ]))
+        response = '{"status":"success","summary":"done","files_changed":[],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop", "tokens": {"input": 2, "output": 1}}},
+        ]))
+        results = [
+            module.subprocess.CompletedProcess([], 0, initial, ""),
+            module.subprocess.CompletedProcess([], 0, recovery, ""),
+        ]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="read-only", timeout=90, no_record=True)
+            with patch.object(module, "invoke_codex", side_effect=results) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(invoke.call_args_list[1].args[0][invoke.call_args_list[1].args[0].index("--session") + 1], "session_abcdefgh")
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["finalization_recovery_count"], 1)
+        self.assertEqual(payload["usage"], {"input_tokens": 12, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 4, "reasoning_output_tokens": 0})
+        self.assertEqual(payload["accepted_usage"], {"input_tokens": 2, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0})
+
+    def test_read_timeout_can_finalize_the_same_session_without_replaying_tools(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "tool-calls"}},
+        ]))
+        response = '{"status":"success","summary":"done","files_changed":[],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="read-only", timeout=75, no_record=True)
+            with patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 124, initial, "timed out"), module.subprocess.CompletedProcess([], 0, recovery, "")]) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertLessEqual(invoke.call_args_list[0].args[2], 60)
+        self.assertGreaterEqual(invoke.call_args_list[0].args[2], 59)
+        self.assertLessEqual(invoke.call_args_list[1].args[2], 15)
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["finalization_recovery_count"], 1)
+
+    def test_recoverable_stream_without_session_records_only_bounded_skip_reason(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "part": {"reason": "tool-calls"}},
+        ]))
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="read-only", timeout=75, no_record=True)
+            with patch.object(module, "invoke_codex", return_value=module.subprocess.CompletedProcess([], 124, initial, "")) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(payload["finalization_recovery_count"], 0)
+        self.assertEqual(payload["finalization_skip_reason"], "session_unavailable")
+
+    def test_finalization_change_stays_partial_and_never_falls_back(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        snapshots = [{}, {}, {"README.md": "changed"}, {"README.md": "changed"}]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="edit README", task_file=None, role="documentation", workdir=workdir, provider="auto", sandbox="auto", timeout=90, no_record=True)
+            with patch.object(module, "workspace_snapshot", side_effect=snapshots), patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 0, initial, ""), module.subprocess.CompletedProcess([], 0, recovery, "")]) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["files_changed"], ["README.md"])
+        self.assertEqual(payload["finalization_recovery_count"], 1)
+
+    def test_write_stream_can_finalize_same_session_without_replaying_or_changing_files(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "tool-calls"}},
+        ]))
+        response = '{"status":"success","summary":"wrote README","files_changed":["README.md"],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        snapshots = [{}, {"README.md": "changed"}, {"README.md": "changed"}, {"README.md": "changed"}]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="edit README", task_file=None, role="documentation", workdir=workdir, provider="sensenova", sandbox="workspace-write", timeout=90, no_record=True)
+            with patch.object(module, "workspace_snapshot", side_effect=snapshots), patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 0, initial, ""), module.subprocess.CompletedProcess([], 0, recovery, "")]) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertIn("--session", invoke.call_args_list[1].args[0])
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["files_changed"], ["README.md"])
+        self.assertEqual(payload["finalization_recovery_count"], 1)
+
+    def test_write_timeout_never_finalizes_a_forced_termination(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "tool-calls"}},
+        ]))
+        snapshots = [{}, {"README.md": "changed"}, {"README.md": "changed"}]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="edit README", task_file=None, role="documentation", workdir=workdir, provider="sensenova", sandbox="workspace-write", timeout=90, no_record=True)
+            with patch.object(module, "workspace_snapshot", side_effect=snapshots), patch.object(module, "invoke_codex", return_value=module.subprocess.CompletedProcess([], 124, initial, "timed out")) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 1)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["finalization_recovery_count"], 0)
+        self.assertEqual(payload["finalization_skip_reason"], "process_exit")
+
+    def test_write_finalization_mutation_is_partial_and_never_accepted(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "tool-calls"}},
+        ]))
+        response = '{"status":"success","summary":"wrote files","files_changed":["README.md","unexpected.txt"],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        snapshots = [{}, {"README.md": "changed"}, {"README.md": "changed", "unexpected.txt": "changed"}, {"README.md": "changed", "unexpected.txt": "changed"}]
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="edit README", task_file=None, role="documentation", workdir=workdir, provider="sensenova", sandbox="workspace-write", timeout=90, no_record=True)
+            with patch.object(module, "workspace_snapshot", side_effect=snapshots), patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 0, initial, ""), module.subprocess.CompletedProcess([], 0, recovery, "")]):
+                payload = module.run_worker(args)
+        self.assertEqual(payload["status"], "partial")
+        self.assertIn("finalization_changed_workspace", payload["attempt_failure_categories"])
+
+    def test_finalization_tool_use_is_not_accepted_as_a_second_execution(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        response = '{"status":"success","summary":"done","files_changed":[],"tests":[],"risks":[]}'
+        recovery = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},
+            {"type": "text", "sessionID": "session_abcdefgh", "part": {"text": response}},
+            {"type": "step_finish", "sessionID": "session_abcdefgh", "part": {"reason": "stop"}},
+        ]))
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="read-only", timeout=90, no_record=True)
+            with patch.object(module, "invoke_codex", side_effect=[module.subprocess.CompletedProcess([], 0, initial, ""), module.subprocess.CompletedProcess([], 0, recovery, "")]):
+                payload = module.run_worker(args)
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("finalization_used_tools", payload["attempt_failure_categories"])
 
     def test_stream_failure_with_workspace_change_does_not_retry(self):
         truncated = "\n".join(map(json.dumps, [
@@ -807,9 +1260,27 @@ class RouterTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as workdir:
             args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="auto", sandbox="auto", timeout=90, no_record=True)
-            with patch.object(module, "invoke_codex", side_effect=results):
+            fallback_config = {**module.RUNTIME_CONFIG, "fallback": {**module.RUNTIME_CONFIG["fallback"], "read_only": ("sensenova", "sensenova1")}}
+            with patch.object(module, "RUNTIME_CONFIG", fallback_config), patch.object(module, "invoke_codex", side_effect=results):
                 payload = module.run_worker(args)
         self.assertEqual(payload["usage"], {"input_tokens": 30, "output_tokens": 5})
+        self.assertEqual(payload["accepted_usage"], {"input_tokens": 20, "output_tokens": 3})
+
+    def test_partial_contract_usage_is_not_counted_as_accepted_success_usage(self):
+        response = '{"status":"partial","summary":"needs review","files_changed":[],"tests":[],"risks":["incomplete"]}'
+        events = [
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "pwd", "status": "completed"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": response}},
+            {"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 3}},
+        ]
+        completed = module.subprocess.CompletedProcess([], 0, "\n".join(map(json.dumps, events)), "")
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="auto", timeout=90, no_record=True)
+            with patch.object(module, "invoke_codex", return_value=completed):
+                payload = module.run_worker(args)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["usage"], {"input_tokens": 20, "output_tokens": 3})
+        self.assertEqual(payload["accepted_usage"], {})
 
     def test_valid_json_without_task_activity_is_not_accepted(self):
         response = '{"status":"success","summary":"guessed","files_changed":[],"tests":[],"risks":[]}'
@@ -817,7 +1288,8 @@ class RouterTests(unittest.TestCase):
         completed = module.subprocess.CompletedProcess([], 0, no_tools, "")
         with tempfile.TemporaryDirectory() as workdir:
             args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="auto", sandbox="auto", timeout=90, no_record=True)
-            with patch.object(module, "invoke_codex", return_value=completed) as invoke:
+            fallback_config = {**module.RUNTIME_CONFIG, "fallback": {**module.RUNTIME_CONFIG["fallback"], "read_only": ("sensenova", "sensenova1")}}
+            with patch.object(module, "RUNTIME_CONFIG", fallback_config), patch.object(module, "invoke_codex", return_value=completed) as invoke:
                 payload = module.run_worker(args)
         self.assertEqual(invoke.call_count, 2)
         self.assertEqual(payload["status"], "error")

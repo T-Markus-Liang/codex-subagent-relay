@@ -1,14 +1,18 @@
-.PHONY: audit test release-gate install-local
+.PHONY: audit test release-gate install-local plugin-gate
 
 PYTHON ?= python3.11
 
 audit:
-	$(PYTHON) -m py_compile deepseek-worker scripts/live_soak.py tests/test_worker.py tests/test_release_gate.py tests/test_install.py tests/test_live_soak.py
+	$(PYTHON) -m py_compile deepseek-worker relay_runtime/job_store.py relay_runtime/routing.py relay_runtime/opencode_adapter.py relay_runtime/telemetry.py scripts/live_soak.py scripts/native_soak.py scripts/operational_report.py scripts/operations_dashboard.py scripts/qualify_manifest.py plugins/codex-subagent-relay/mcp/server.py scripts/validate_compatibility.py scripts/validate_plugin_package.py tests/test_worker.py tests/test_release_gate.py tests/test_install.py tests/test_live_soak.py tests/test_native_soak.py tests/test_operational_report.py tests/test_operations_dashboard.py tests/test_mcp.py tests/test_compatibility.py tests/test_marketplace.py tests/test_qualify_manifest.py
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v
 
-release-gate: audit test
+plugin-gate:
+	$(PYTHON) scripts/validate_plugin_package.py
+
+release-gate: audit test plugin-gate
+	$(PYTHON) scripts/validate_compatibility.py
 
 install-local:
 	@$(PYTHON) -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11 or later is required"'

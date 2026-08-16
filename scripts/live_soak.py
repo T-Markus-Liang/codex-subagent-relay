@@ -19,7 +19,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--role", choices=("repository-exploration", "documentation"), required=True)
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=0)
+    parser.add_argument(
+        "--require-opencode-idle",
+        action="store_true",
+        help="Refuse qualification when any pre-existing OpenCode process is running.",
+    )
     parser.add_argument("--poll-seconds", type=float, default=2.0, help="Delay between durable job polls.")
+    parser.add_argument("--job-deadline", type=float, default=180.0, help="Maximum wall-clock seconds for one launch/poll job.")
+    parser.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=0,
+        help="Stop after this many consecutive non-success attempts; 0 runs the whole requested batch.",
+    )
     parser.add_argument("--report", type=Path, required=True)
     return parser.parse_args()
 
@@ -31,26 +43,37 @@ SOAK_CONTENT = "deepseek-worker soak"
 def task_for(role: str) -> str:
     if role == "repository-exploration":
         return "Use an ordinary task tool to inspect this disposable directory. Do not create, modify, or delete files. Return only the required five-field JSON."
-    return "Create exactly one file named soak.txt containing exactly the bytes deepseek-worker soak with no trailing newline. Use the shell command printf %s to write it, then use od to verify its bytes. Do not modify any other file. Return only the required five-field JSON."
+    return (
+        "Create exactly one file named soak.txt containing exactly the bytes deepseek-worker soak with no trailing newline. "
+        "Run this exact shell command: printf '%s' 'deepseek-worker soak' > soak.txt. Then verify it with "
+        "od -An -tx1 -v soak.txt | tr -d ' \\n' and confirm the exact hex value is "
+        "646565707365656b2d776f726b657220736f616b. Do not modify any other file. Return only the required five-field JSON."
+    )
 
 
-def verify_workspace(workdir: Path, role: str) -> tuple[bool, str]:
+def verify_workspace(workdir: Path, role: str) -> tuple[bool, bool, str]:
+    """Return (safe, expected_output, reason) without confusing a no-op failure with a bad write."""
     paths = sorted(path.name for path in workdir.iterdir())
     if role == "repository-exploration":
-        return (not paths, "ok" if not paths else "read-only workspace changed")
+        return (not paths, not paths, "ok" if not paths else "read-only workspace changed")
+    if not paths:
+        return True, False, "write task produced no output"
     expected = [SOAK_FILENAME]
     if paths != expected:
-        return False, "write task created unexpected paths"
+        return False, False, "write task created unexpected paths"
     try:
-        return (
-            (workdir / SOAK_FILENAME).read_text(encoding="utf-8") == SOAK_CONTENT,
-            "ok" if (workdir / SOAK_FILENAME).read_text(encoding="utf-8") == SOAK_CONTENT else "write content mismatch",
-        )
+        output_matches = (workdir / SOAK_FILENAME).read_text(encoding="utf-8") == SOAK_CONTENT
+        return output_matches, output_matches, "ok" if output_matches else "write content mismatch"
     except OSError:
-        return False, "write output unreadable"
+        return False, False, "write output unreadable"
 
 
 def failure_class(payload: dict, workspace_reason: str) -> str | None:
+    if payload.get("status") == "blocked":
+        categories = payload.get("attempt_failure_categories") or []
+        if "provider_busy" in categories:
+            return "worker:provider_busy"
+        return "worker:blocked"
     if workspace_reason != "ok":
         return workspace_reason
     if payload.get("status") == "success":
@@ -72,78 +95,47 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[index], 2)
 
 
-def run_job(worker: str, command: list[str], poll_seconds: float) -> tuple[dict, float]:
-    """Drive the durable lifecycle so a long Provider call is never tied to one shell session."""
-    started = time.monotonic()
-    launched = subprocess.run([worker, "--json", "launch", *command], text=True, capture_output=True, check=False)
+def consecutive_failure_stop(records: list[dict], limit: int) -> str | None:
+    """Return a bounded diagnostic reason without weakening qualification acceptance."""
+    if records and records[-1].get("failure_class") == "worker:provider_busy":
+        return "provider busy; qualification batch not started"
+    if limit <= 0 or len(records) < limit:
+        return None
+    recent = records[-limit:]
+    if all(record.get("status") != "success" or not record.get("expected_output") for record in recent):
+        return f"{limit} consecutive non-success attempts"
+    return None
+
+
+def opencode_idle_preflight() -> dict:
+    """Prove only whether OpenCode is idle; never retain process IDs or command arguments."""
     try:
-        launch_payload = json.loads(launched.stdout)
-        job_id = str(launch_payload["job_id"])
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return {"status": "invalid-output"}, round(time.monotonic() - started, 2)
-    while True:
-        polled = subprocess.run([worker, "--json", "poll", "--job-id", job_id], text=True, capture_output=True, check=False)
-        try:
-            payload = json.loads(polled.stdout)
-        except json.JSONDecodeError:
-            payload = {"status": "invalid-output"}
-        if payload.get("status") != "running":
-            return payload, round(time.monotonic() - started, 2)
-        time.sleep(max(0.1, poll_seconds))
+        completed = subprocess.run(
+            ["ps", "-axo", "comm="], text=True, capture_output=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"opencode_idle": False, "observed_opencode_process_count": None, "inspection": "unavailable"}
+    if completed.returncode != 0:
+        return {"opencode_idle": False, "observed_opencode_process_count": None, "inspection": "unavailable"}
+    count = sum(Path(line.strip()).name == "opencode" for line in completed.stdout.splitlines() if line.strip())
+    return {"opencode_idle": count == 0, "observed_opencode_process_count": count, "inspection": "ok"}
 
 
-def main() -> int:
-    args = parse_args()
-    if not args.confirm_live:
-        raise SystemExit("refusing live calls without --confirm-live")
-    if args.runs < 1 or args.runs > 1000:
-        raise SystemExit("--runs must be between 1 and 1000")
-    if not shutil.which(args.worker) and not Path(args.worker).is_file():
-        raise SystemExit("worker command not found")
-
-    records = []
-    for index in range(1, args.runs + 1):
-        with tempfile.TemporaryDirectory(prefix="deepseek-worker-soak-") as temporary_dir:
-            command = [
-                "--role",
-                args.role,
-                "--workdir",
-                temporary_dir,
-                "--provider",
-                args.provider,
-                "--timeout",
-                str(args.timeout),
-                "--no-record",
-                "--task",
-                task_for(args.role),
-            ]
-            payload, duration = run_job(args.worker, command, args.poll_seconds)
-            workspace_ok, workspace_reason = verify_workspace(Path(temporary_dir), args.role)
-            records.append(
-                {
-                    "run": index,
-                    "status": payload.get("status", "invalid-output"),
-                    "duration_seconds": duration,
-                    "selected_provider": payload.get("provider"),
-                    "stream_finish_reason": payload.get("stream_finish_reason"),
-                    "stream_retry_count": payload.get("stream_retry_count", 0),
-                    "fallback_used": "provider fallback was used after an earlier DeepSeek route failed" in (payload.get("risks") or []),
-                    "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
-                    "workspace_ok": workspace_ok,
-                    "failure_class": failure_class(payload, workspace_reason),
-                }
-            )
-
+def build_report(args: argparse.Namespace, records: list[dict], interrupted: bool, early_stop_reason: str | None, preflight: dict) -> dict:
     durations = [record["duration_seconds"] for record in records]
-    successes = sum(record["status"] == "success" and record["workspace_ok"] for record in records)
-    report = {
+    successes = sum(record["status"] == "success" and record["expected_output"] for record in records)
+    return {
         "timestamp": datetime.now(UTC).isoformat(),
         "worker": args.worker,
         "provider": args.provider,
         "role": args.role,
-        "runs": args.runs,
+        "runs": len(records),
+        "requested_runs": args.runs,
+        "interrupted": interrupted,
+        "early_stop_reason": early_stop_reason,
+        "qualification_preflight": preflight,
         "successes": successes,
-        "success_rate_percent": round(100 * successes / args.runs, 2),
+        "success_rate_percent": round(100 * successes / len(records), 2) if records else 0.0,
         "p50_duration_seconds": percentile(durations, 0.5),
         "p95_duration_seconds": percentile(durations, 0.95),
         "status_counts": {status: sum(record["status"] == status for record in records) for status in sorted({record["status"] for record in records})},
@@ -154,17 +146,152 @@ def main() -> int:
         "stream_finish_counts": {reason: sum(record["stream_finish_reason"] == reason for record in records) for reason in sorted({record["stream_finish_reason"] for record in records}, key=str)},
         "fallback_runs": sum(record["fallback_used"] for record in records),
         "partial_write_runs": sum(record["partial_write"] for record in records),
-        "workspace_verification_failures": sum(not record["workspace_ok"] for record in records),
+        "workspace_verification_failures": sum(not record["workspace_safe"] for record in records),
+        "expected_output_failures": sum(not record["expected_output"] for record in records),
+        "duplicate_write_incidents": (
+            0
+            if args.role == "documentation" and all(record["workspace_safe"] and not record["partial_write"] for record in records)
+            else None
+        ),
+        "write_safety_violations": (
+            sum(record["partial_write"] or not record["workspace_safe"] for record in records)
+            if args.role == "documentation"
+            else 0
+        ),
         "failure_classes": {
             reason: sum(record["failure_class"] == reason for record in records)
             for reason in sorted({record["failure_class"] for record in records if record["failure_class"] is not None})
         },
         "records": records,
     }
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
+def write_report(path: Path, report: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
+def cancel_job(worker: str, job_id: str) -> dict:
+    result = subprocess.run(
+        [worker, "--json", "cancel", "--job-id", job_id],
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        payload = {"status": "invalid-output"}
+    return payload
+
+
+def run_job(worker: str, command: list[str], poll_seconds: float, deadline_seconds: float = 180.0) -> tuple[dict, float]:
+    """Drive one durable job with an outer deadline and same-job cancellation."""
+    if deadline_seconds <= 0:
+        raise ValueError("deadline_seconds must be positive")
+    started = time.monotonic()
+    try:
+        launched = subprocess.run([worker, "--json", "launch", *command], text=True, capture_output=True, check=False, timeout=min(20.0, deadline_seconds))
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "risks": ["live soak launch command exceeded its outer deadline"]}, round(time.monotonic() - started, 2)
+    try:
+        launch_payload = json.loads(launched.stdout)
+        job_id = str(launch_payload["job_id"])
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return {"status": "invalid-output"}, round(time.monotonic() - started, 2)
+    try:
+        while True:
+            elapsed = time.monotonic() - started
+            if elapsed >= deadline_seconds:
+                cancelled = cancel_job(worker, job_id)
+                cancelled.setdefault("status", "cancelled")
+                cancelled["job_id"] = job_id
+                cancelled.setdefault("risks", []).append("live soak outer deadline reached; same durable job was cancelled")
+                return cancelled, round(time.monotonic() - started, 2)
+            try:
+                polled = subprocess.run([worker, "--json", "poll", "--job-id", job_id], text=True, capture_output=True, check=False, timeout=min(20.0, max(1.0, deadline_seconds - elapsed)))
+            except subprocess.TimeoutExpired:
+                cancelled = cancel_job(worker, job_id)
+                cancelled.setdefault("status", "cancelled")
+                cancelled["job_id"] = job_id
+                cancelled.setdefault("risks", []).append("live soak poll command exceeded its outer deadline; same durable job was cancelled")
+                return cancelled, round(time.monotonic() - started, 2)
+            try:
+                payload = json.loads(polled.stdout)
+            except json.JSONDecodeError:
+                payload = {"status": "invalid-output"}
+            if payload.get("status") != "running":
+                return payload, round(time.monotonic() - started, 2)
+            time.sleep(min(max(0.1, poll_seconds), max(0.1, deadline_seconds - (time.monotonic() - started))))
+    except KeyboardInterrupt:
+        cancelled = cancel_job(worker, job_id)
+        cancelled.setdefault("status", "cancelled")
+        cancelled["job_id"] = job_id
+        cancelled.setdefault("risks", []).append("live soak interrupted; same durable job was cancelled")
+        raise
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.confirm_live:
+        raise SystemExit("refusing live calls without --confirm-live")
+    if args.runs < 1 or args.runs > 1000:
+        raise SystemExit("--runs must be between 1 and 1000")
+    if args.max_consecutive_failures < 0:
+        raise SystemExit("--max-consecutive-failures must be zero or positive")
+    if not shutil.which(args.worker) and not Path(args.worker).is_file():
+        raise SystemExit("worker command not found")
+
+    records = []
+    interrupted = False
+    early_stop_reason = None
+    preflight = {
+        "opencode_idle": None,
+        "observed_opencode_process_count": None,
+        "inspection": "not_required",
+    }
+    if args.require_opencode_idle:
+        preflight = opencode_idle_preflight()
+        if not preflight["opencode_idle"]:
+            early_stop_reason = "qualification requires an idle OpenCode environment"
+            report = build_report(args, records, interrupted, early_stop_reason, preflight)
+            write_report(args.report, report)
+            print(json.dumps(report, separators=(",", ":")))
+            return 2
+    for index in range(1, args.runs + 1):
+        try:
+            with tempfile.TemporaryDirectory(prefix="deepseek-worker-soak-") as temporary_dir:
+                command = [
+                    "--role", args.role, "--workdir", temporary_dir, "--provider", args.provider,
+                    "--timeout", str(args.timeout), "--no-record", "--task", task_for(args.role),
+                ]
+                payload, duration = run_job(args.worker, command, args.poll_seconds, args.job_deadline)
+                workspace_safe, expected_output, workspace_reason = verify_workspace(Path(temporary_dir), args.role)
+                records.append({
+                    "run": index,
+                    "status": payload.get("status", "invalid-output"),
+                    "duration_seconds": duration,
+                    "selected_provider": payload.get("provider"),
+                    "stream_finish_reason": payload.get("stream_finish_reason"),
+                    "stream_retry_count": payload.get("stream_retry_count", 0),
+                    "fallback_used": "provider fallback was used after an earlier DeepSeek route failed" in (payload.get("risks") or []),
+                    "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
+                    "workspace_safe": workspace_safe,
+                    "expected_output": expected_output,
+                    "failure_class": failure_class(payload, workspace_reason),
+                })
+                early_stop_reason = consecutive_failure_stop(records, args.max_consecutive_failures)
+                if early_stop_reason:
+                    break
+        except KeyboardInterrupt:
+            interrupted = True
+            break
+
+    report = build_report(args, records, interrupted, early_stop_reason, preflight)
+    write_report(args.report, report)
     print(json.dumps(report, separators=(",", ":")))
-    return 0 if successes == args.runs else 1
+    return 0 if not interrupted and report["successes"] == args.runs else 1
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.31.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -13,13 +13,31 @@ It is not affiliated with or endorsed by OpenAI, Codex, DeepSeek, SenseNova, Ope
 
 ## What It Does
 
-- Routes read-heavy work to `sensenova1` first and falls back to `sensenova`; write-heavy work uses the same order.
+- Routes automatic work only to the currently retained production route. `sensenova1` is quarantined from production auto-routing after a 6.25% strict-success observation and remains available only for explicit diagnostic or qualification runs. Re-run fresh explicit qualification before restoring it.
 - Requires real tool activity, a healthy terminal stream, a strict five-field JSON result, and a matching workspace diff before accepting a result.
+- When an OpenCode stream has real tool activity but omits its final JSON, the relay may use a short, same-session, no-tool contract-finalization request before ordinary retry/fallback. A single-provider task reserves that time within its existing deadline. After a write it can finalize only after the initial Provider process exits naturally; any Worker-forced timeout, finalization tool activity, or additional workspace change remains `partial`. It never replays the task or uses Provider fallback after a changed workspace.
 - Retries a stream failure once, then uses bounded Provider fallback only when the workspace is unchanged.
 - Stops on a partial write rather than replaying the task with another Provider.
 - Keeps native Codex Agent Team integrations canary-only.
 
 It does **not** provision Provider accounts, API keys, OpenCode, Codex profiles, local bridges, or a third-party Provider. This is a local relay around an already-working integration.
+
+## Native Agent Team Status
+
+Native Codex Agent Team remains a research backend, not a production execution path. The Relay
+includes `native-role-bisection`, which runs `builtin`, `minimal`, `model-only`, `provider-only`,
+and full-role V1 canaries in a disposable `CODEX_HOME`. It never changes the live Codex provider,
+conversation history, or state database.
+
+On Desktop Codex `0.147.0-alpha.6.5`, a fresh direct V1 probe found that the parent must explicitly
+call the V1 `wait_agent` tool after `spawn_agent`; a plain-language request to wait did not produce
+the required parent-side result. With that contract fixed, all three `gpt-5.5` and `gpt-5.6-sol`
+routes plus the SenseNova pair for `gpt-5.6-terra` passed isolated end-to-end delivery canaries: spawn, wait,
+nonce-bearing child JSON, bridge completion, and isolated child metadata all matched. Terra's
+`opencode-go/default` probe timed out before its parent emitted an event, so it is not accepted as
+Provider evidence. These eight passing diagnostics are not production evidence; tool-bearing tasks
+and the 100+ native promotion gate still require fresh evidence.
+Continue to use external `launch -> poll` for production.
 
 ## Job Lifecycle
 
@@ -35,6 +53,16 @@ States are `queued`, `running`, `succeeded`, `partial`, `blocked`, `failed`, `ca
 recorded as `failed` or `timed_out` and remains eligible for a caller-controlled new attempt.
 An asynchronous job owns its worker and OpenCode process group, so `cancel` and deadline recovery
 terminate the currently executing provider process before the terminal state is made durable.
+
+## Runtime Boundaries
+
+`relay_runtime/routing.py` owns pure secret-free policy validation, role classification, Provider
+ordering, and timeout allocation. `relay_runtime/opencode_adapter.py` builds only the reviewed,
+fixed-shape OpenCode commands from that policy. `relay_runtime/job_store.py` owns durable job
+artifacts. `relay_runtime/telemetry.py` owns only the privacy-preserving aggregate run record.
+The CLI owns process execution and compatibility commands; the MCP plugin remains a typed facade
+over the installed CLI. This separation prevents a policy test from spawning a Provider process and
+keeps Provider credentials outside the repository.
 
 ## Requirements
 
@@ -57,7 +85,7 @@ deepseek-worker --version
 deepseek-worker --json doctor
 ```
 
-The installer creates `~/.local/bin/deepseek-worker`; add that directory to `PATH` if needed. It writes a launcher bound to the Python interpreter used during installation, preventing an older system `python3` from running the Worker. A healthy `doctor` report is required before live work.
+The installer creates `~/.local/bin/deepseek-worker`; add that directory to `PATH` if needed. It writes a launcher bound to the Python interpreter used during installation, preventing an older system `python3` from running the Worker. The repository script itself also requires `python3.11` when run directly. A healthy `doctor` report is required before live work.
 
 ## Quick Start
 
@@ -102,6 +130,9 @@ deepseek-worker --json status --job-id <job_id>
 deepseek-worker --json cancel --job-id <job_id>
 deepseek-worker --json list --limit 20
 deepseek-worker --json inspect --job-id <job_id>
+deepseek-worker --json cleanup --retention-hours 168
+deepseek-worker --json cleanup --retention-hours 168 --apply
+deepseek-worker --json cleanup --retention-hours 168 --legacy-action archive
 ```
 
 Every accepted terminal result has this exact core contract:
@@ -116,19 +147,56 @@ Every accepted terminal result has this exact core contract:
 }
 ```
 
-The relay adds bounded metadata such as Provider, duration, usage, and stream retry count. Independently inspect `files_changed`, `git diff`, and the listed tests before accepting any write.
+The relay adds bounded metadata such as Provider, duration, usage, and stream retry count. `usage` is all Provider-attempt usage, including failures and safe retries; `accepted_usage` contains only the final Provider attempt that finished with `status: success` under the strict result contract, and is empty for errors or partial writes. Independently inspect `files_changed`, `git diff`, and the listed tests before accepting any write.
 
 ## Routing And Safety
 
 | Role family | Default Provider order | Sandbox | Default budget |
 | --- | --- | --- | --- |
-| `search`, `repository-exploration`, `logs` | `sensenova1 -> sensenova` | read-only | 75 seconds |
-| `implementation`, `test`, `debug`, `refactor`, `docs` | `sensenova1 -> sensenova` | workspace-write | 120 seconds |
+| `search`, `repository-exploration`, `logs` | `sensenova` | read-only | 75 seconds |
+| `implementation`, `test`, `debug`, `refactor`, `docs` | `sensenova` | workspace-write | 120 seconds |
 | architecture, planning, final review | kept by the caller | n/a | n/a |
 
-`opencode-go` is available only with an explicit `--provider` for diagnostics; it is not part of automatic production fallback. The Worker serializes concurrent write tasks per workdir. A write that changes files but fails the result contract returns `partial` and stops all retry/fallback. Review that diff manually.
+`sensenova1` and `opencode-go` are available only with an explicit `--provider` for diagnostics or qualification; neither is part of automatic production routing. The Worker serializes concurrent write tasks per workdir. A write that changes files but fails the result contract returns `partial` and stops all retry/fallback. Review that diff manually.
 
-Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
+Terminal job artifacts are retained for seven days by default. Cleanup is a dry run unless
+`--apply` is supplied; it never deletes queued/running jobs, malformed directories, or jobs completed
+inside the specified retention window. Review the candidate IDs before applying cleanup.
+
+Earlier Worker releases stored flat `<job-id>.json` records in the job root. Current `list` reports
+them as `legacy` using only safe lifecycle fields; `inspect` is read-only and they cannot be resumed.
+Normal cleanup leaves them untouched. First preview `cleanup --legacy-action archive`, then add
+`--apply` to move verified inactive records to the private `legacy/` directory. This never deletes or
+converts historical artifacts.
+
+Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. It reports requested-route (`auto` versus explicit) and terminal-Provider counts, role/Provider success rates, p50/p95 duration, fallback, partial-write, stream-retry, bounded same-session-finalization skip reasons, all-attempt usage, and accepted-success usage. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
+
+For the Phase 4 rolling observation, render the same local source as a UTC daily report:
+
+```bash
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.31 \
+  --run-type external_run --telemetry-scope production \
+  --since <release-utc-timestamp> --out reports/operational-7d.json
+```
+
+The report separates `external_run` from native canaries and groups requested-route (`auto` versus explicit) attribution, terminal Provider, success rate, P50/P95, fallback,
+retry, partial-write, Provider-busy blocks, bounded attempt-failure categories, and separate all-attempt versus accepted-success Relay usage by UTC day and Provider. Start a new qualifying
+seven-day window after a Relay/runtime/Provider-policy change; do not combine old versions, stress
+experiments, qualification retries, or canaries into a production SLO. The report does not include
+task text and must not be added to Codex Rollout or CC Switch token ledgers.
+
+To create a local static dashboard, first generate the Relay report and separately export the reviewed
+Codex/CC Switch usage audit JSON. The dashboard shows each ledger independently and never adds their
+token totals:
+
+```bash
+python3 /Users/markus/.codex/skills/codex-usage-audit/scripts/codex_usage_audit.py --hours 168 --format json > /tmp/codex-usage.json
+python3.11 scripts/operations_dashboard.py \
+  --relay-report reports/operational-7d.json \
+  --usage-audit /tmp/codex-usage.json \
+  --out reports/operations-dashboard.json \
+  --html-out reports/operations-dashboard.html
+```
 
 Automatic routing maintains a short-lived per-Provider circuit in `~/.codex/deepseek-worker-circuit.json`. Two no-side-effect failures temporarily skip a Provider for 30 seconds, allowing the other route to run without spending its full timeout. Explicit `--provider` diagnostics bypass this state. State persistence is fail-open: an unreadable or unwritable circuit file never blocks a task. Any workspace side effect still stops retry and fallback.
 
@@ -148,17 +216,55 @@ deepseek-worker --json status --job-id <job_id>
 deepseek-worker --json cancel --job-id <job_id>
 deepseek-worker --json list --limit 20
 deepseek-worker --json inspect --job-id <job_id>
+deepseek-worker --json cleanup --retention-hours 168
 deepseek-worker --json smoke-test --provider sensenova --workdir /path/to/repo
 deepseek-worker --json stats --hours 8
 ```
 
-`run` invokes OpenCode directly with the configured third-party model IDs. Read-heavy roles use OpenCode's `plan` agent; implementation roles use its `build` agent. Production runs do not change Codex App root Provider or create Codex task threads.
+`run` invokes OpenCode directly with the configured third-party model IDs. Read-heavy roles use Relay's process-local `relay-readonly` Agent; implementation roles use `relay-workspace-write`. Production runs do not change Codex App root Provider or create Codex task threads. A single-provider task reserves up to 15 seconds from its existing timeout for a same-session, no-tool finalization. A read can finalize after a Worker timeout; a write can finalize only after its initial process exits naturally. Both paths reject any finalization tool activity or finalization-time workspace change, never extend the caller's deadline, and never replay the original task. The opaque session ID is held only in memory and is not written to job artifacts or aggregate telemetry.
 
-`catalog-build`, `native-check`, `native-v1-canary`, and `cliproxy-native-canary` are experimental diagnostics. Native V1/V2 results do not establish production route reliability. See [Configuration](docs/CONFIGURATION.md) and [Release Testing](docs/RELEASE_TESTING.md).
+Relay execution uses a process-local OpenCode envelope: `--pure`, project-config discovery disabled,
+and two injected minimal Agents (`relay-readonly` and `relay-workspace-write`) with recursive tasks
+disabled. This avoids inheriting a project's `plan`/`build` Agent behavior while preserving the
+user's global Provider settings and credentials. Managed OpenCode policy can still apply; normal
+interactive OpenCode sessions and configuration files are unchanged.
+
+`catalog-build`, `native-check`, `native-v1-canary`, `native-v1-tool-canary`, and `cliproxy-native-canary` are experimental diagnostics. `native-v1-tool-canary` is an isolated no-write challenge: it requires the child to make two parallel shell calls for hidden files, return the exact contract through V1 `wait_agent`, and leave evidence in the isolated rollout and state database. `scripts/native_soak.py` runs the required sequential 100-sample research gate while retaining only booleans and fixed error categories. Native V1/V2 results do not establish production route reliability. See [Configuration](docs/CONFIGURATION.md) and [Release Testing](docs/RELEASE_TESTING.md).
+
+## Codex Plugin And MCP
+
+The bundled plugin package exposes the stable Relay lifecycle as local typed MCP tools:
+relay_doctor, relay_launch, relay_status, relay_cancel, and relay_stats. It is a thin stdio facade
+over the locally installed Worker launcher: it does not receive Provider credentials, call a Provider
+directly, or mutate Codex Provider/session configuration.
+
+The repository includes a marketplace manifest at `.agents/plugins/marketplace.json`. Add the
+repository as a local or Git marketplace, then install the plugin:
+
+```bash
+codex plugin marketplace add /absolute/path/to/codex-subagent-relay
+codex plugin add codex-subagent-relay@codex-subagent-relay
+```
+
+Install the Worker first with `PYTHON=python3.11 make install-local`. Codex loads plugins from its
+own cache, so the plugin intentionally uses that stable user-local launcher rather than a relative
+path inside the cached package.
+
+For a Git checkout, use the repository URL instead of the local path. Validate the package with the
+Codex plugin validator before installing it in Codex. After installation, start a new Codex thread
+so the thread loads the updated Skill and MCP tool declarations.
+
+The external Relay remains the production execution backend. Native Codex Subagents remain
+canary-only until their independent promotion gate passes.
+
+The tracked compatibility manifest is structurally valid without live evidence. A stable
+publication requires separate qualifying records for both production routes. Run
+scripts/validate_compatibility.py with --require-evidence to enforce that gate; it intentionally
+fails while either route lacks 100 read plus 100 write qualifying evidence.
 
 ## Testing
 
-`make release-gate` is credential-free and runs deterministic unit, fault-injection, fallback, concurrency, job-isolation, redaction, qualification-workspace, and install-launcher checks. GitHub Actions runs this same gate for pushes and pull requests. Live Provider soaks are opt-in, consume quota, and require a disposable directory per attempt. The runner defaults to the actual `auto` route and verifies that reads are non-mutating and writes produce exactly the expected file. The exact commands, metrics, and pass/fail thresholds are in [Release Testing](docs/RELEASE_TESTING.md).
+`make release-gate` is credential-free and runs deterministic unit, fault-injection, fallback, concurrency, job-isolation, redaction, qualification-workspace, plugin-package, and install-launcher checks. GitHub Actions runs this same gate for pushes and pull requests. Live Provider soaks are opt-in, consume quota, and require a disposable directory per attempt. The runner defaults to the actual `auto` route, uses a bounded per-job deadline, cancels the same durable job on interruption, and verifies that reads are non-mutating and writes produce exactly the expected file. The exact commands, metrics, and pass/fail thresholds are in [Release Testing](docs/RELEASE_TESTING.md).
 
 ## Contributing And Security
 

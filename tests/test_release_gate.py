@@ -37,6 +37,22 @@ def successful_stream(summary: str = "done") -> str:
 
 
 class ReleaseGateTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_dir = tempfile.TemporaryDirectory()
+        root = Path(self.runtime_dir.name)
+        self.patches = [
+            patch.object(module, "CIRCUIT_STATE_PATH", root / "circuit.json"),
+            patch.object(module, "CIRCUIT_LOCK_PATH", root / "circuit.lock"),
+            patch.object(module, "PROVIDER_LOCK_ROOT", root / "provider-locks"),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.runtime_dir.cleanup()
+
     def test_fault_matrix_rejects_bad_streams_and_accepts_only_complete_contracts(self):
         cases = {
             "missing_finish": "\n".join(
@@ -121,7 +137,9 @@ class ReleaseGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as circuit_dir:
             args.workdir = workdir
             responses = [item for _ in range(32) for item in (invalid, valid)]
-            with patch.object(module, "invoke_codex", side_effect=responses) as invoke, \
+            fallback_config = {**module.RUNTIME_CONFIG, "fallback": {**module.RUNTIME_CONFIG["fallback"], "read_only": ("sensenova", "sensenova1")}}
+            with patch.object(module, "RUNTIME_CONFIG", fallback_config), \
+                 patch.object(module, "invoke_codex", side_effect=responses) as invoke, \
                  patch.object(module, "CIRCUIT_STATE_PATH", Path(circuit_dir) / "circuit.json"), \
                  patch.object(module, "CIRCUIT_LOCK_PATH", Path(circuit_dir) / "circuit.lock"):
                 payloads = []
@@ -130,7 +148,7 @@ class ReleaseGateTests(unittest.TestCase):
                     payloads.append(module.run_worker(args))
         self.assertEqual(invoke.call_count, 64)
         self.assertTrue(all(payload["status"] == "success" for payload in payloads))
-        self.assertTrue(all(payload["provider"] == "sensenova" for payload in payloads))
+        self.assertTrue(all(payload["provider"] == "sensenova1" for payload in payloads))
         self.assertTrue(all(payload["timeout_seconds"] == 75 for payload in payloads))
 
     def test_parallel_write_lock_allows_one_owner_and_blocks_contenders(self):
@@ -218,13 +236,27 @@ class ReleaseGateTests(unittest.TestCase):
                 "usage": {},
                 "summary": "do not record this task body",
                 "risks": ["do not record secret sk-example-value"],
+                "requested_provider": "auto",
+                "fallback_attempted": True,
             }
             with patch.object(module, "RUN_LOG_PATH", log_path):
                 module.record_run(payload)
             recorded = log_path.read_text(encoding="utf-8")
         self.assertNotIn("task body", recorded)
         self.assertNotIn("sk-example-value", recorded)
-        self.assertEqual(set(json.loads(recorded).keys()), {"timestamp", "run_type", "status", "provider", "role", "duration_seconds", "stream_finish_reason", "stream_retry_count", "usage"})
+        record = json.loads(recorded)
+        self.assertEqual(
+            set(record),
+            {
+                "timestamp", "relay_version", "run_type", "telemetry_scope", "status", "provider", "role", "duration_seconds",
+                "requested_provider", "stream_finish_reason", "stream_retry_count", "finalization_recovery_count", "finalization_skip_reason", "fallback_used", "partial_write", "attempt_failure_categories", "usage", "accepted_usage",
+            },
+        )
+        self.assertIsInstance(record["fallback_used"], bool)
+        self.assertEqual(record["requested_provider"], "auto")
+        self.assertTrue(record["fallback_used"])
+        self.assertIsInstance(record["partial_write"], bool)
+        self.assertEqual(record["attempt_failure_categories"], [])
 
 
 if __name__ == "__main__":
