@@ -43,7 +43,12 @@ SOAK_CONTENT = "deepseek-worker soak"
 def task_for(role: str) -> str:
     if role == "repository-exploration":
         return "Use an ordinary task tool to inspect this disposable directory. Do not create, modify, or delete files. Return only the required five-field JSON."
-    return "Create exactly one file named soak.txt containing exactly the bytes deepseek-worker soak with no trailing newline. Use the shell command printf %s to write it, then use od to verify its bytes. Do not modify any other file. Return only the required five-field JSON."
+    return (
+        "Create exactly one file named soak.txt containing exactly the bytes deepseek-worker soak with no trailing newline. "
+        "Run this exact shell command: printf '%s' 'deepseek-worker soak' > soak.txt. Then verify it with "
+        "od -An -tx1 -v soak.txt | tr -d ' \\n' and confirm the exact hex value is "
+        "646565707365656b2d776f726b657220736f616b. Do not modify any other file. Return only the required five-field JSON."
+    )
 
 
 def verify_workspace(workdir: Path, role: str) -> tuple[bool, bool, str]:

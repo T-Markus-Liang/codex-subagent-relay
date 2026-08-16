@@ -37,7 +37,8 @@ class LiveSoakTests(unittest.TestCase):
             )
 
     def test_write_task_requires_exact_no_newline_bytes(self):
-        self.assertIn("printf %s", module.task_for("documentation"))
+        self.assertIn("printf '%s' 'deepseek-worker soak' > soak.txt", module.task_for("documentation"))
+        self.assertIn("646565707365656b2d776f726b657220736f616b", module.task_for("documentation"))
         self.assertIn("no trailing newline", module.task_for("documentation"))
         self.assertEqual(module.SOAK_CONTENT.encode(), b"deepseek-worker soak")
 
