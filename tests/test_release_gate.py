@@ -249,7 +249,7 @@ class ReleaseGateTests(unittest.TestCase):
             set(record),
             {
                 "timestamp", "relay_version", "run_type", "telemetry_scope", "status", "provider", "role", "duration_seconds",
-                "requested_provider", "stream_finish_reason", "stream_retry_count", "finalization_recovery_count", "fallback_used", "partial_write", "attempt_failure_categories", "usage", "accepted_usage",
+                "requested_provider", "stream_finish_reason", "stream_retry_count", "finalization_recovery_count", "finalization_skip_reason", "fallback_used", "partial_write", "attempt_failure_categories", "usage", "accepted_usage",
             },
         )
         self.assertIsInstance(record["fallback_used"], bool)

@@ -1098,6 +1098,19 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["finalization_recovery_count"], 1)
 
+    def test_recoverable_stream_without_session_records_only_bounded_skip_reason(self):
+        initial = "\n".join(map(json.dumps, [
+            {"type": "tool_use", "part": {"state": {"status": "completed"}}},
+            {"type": "step_finish", "part": {"reason": "tool-calls"}},
+        ]))
+        with tempfile.TemporaryDirectory() as workdir:
+            args = SimpleNamespace(task="inspect", task_file=None, role="repository-exploration", workdir=workdir, provider="sensenova", sandbox="read-only", timeout=75, no_record=True)
+            with patch.object(module, "invoke_codex", return_value=module.subprocess.CompletedProcess([], 124, initial, "")) as invoke:
+                payload = module.run_worker(args)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(payload["finalization_recovery_count"], 0)
+        self.assertEqual(payload["finalization_skip_reason"], "session_unavailable")
+
     def test_finalization_change_stays_partial_and_never_falls_back(self):
         initial = "\n".join(map(json.dumps, [
             {"type": "tool_use", "sessionID": "session_abcdefgh", "part": {"state": {"status": "completed"}}},

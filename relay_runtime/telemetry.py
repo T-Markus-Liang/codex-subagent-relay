@@ -28,6 +28,7 @@ def run_record(payload: dict[str, Any], relay_version: str, run_type: str, telem
         "stream_finish_reason": payload.get("stream_finish_reason"),
         "stream_retry_count": payload.get("stream_retry_count", 0),
         "finalization_recovery_count": payload.get("finalization_recovery_count", 0),
+        "finalization_skip_reason": payload.get("finalization_skip_reason"),
         "fallback_used": bool(payload.get("fallback_attempted")) or "provider fallback was used after an earlier DeepSeek route failed" in risks,
         "partial_write": payload.get("status") == "partial" and bool(payload.get("files_changed")),
         "attempt_failure_categories": list(payload.get("attempt_failure_categories") or []),

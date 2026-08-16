@@ -2,7 +2,7 @@
 
 [![Release Gate](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml/badge.svg)](https://github.com/T-Markus-Liang/codex-subagent-relay/actions/workflows/release-gate.yml)
 
-Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.23.
+Experimental, dependency-free execution relay for delegating bounded Codex tasks to compatible third-party model Providers. Relay version 0.10.24.
 
 Codex remains the planner and final reviewer. This relay isolates search, implementation, testing,
 debugging, and documentation tasks in a Provider-backed worker with strict result contracts,
@@ -169,12 +169,12 @@ Normal cleanup leaves them untouched. First preview `cleanup --legacy-action arc
 `--apply` to move verified inactive records to the private `legacy/` directory. This never deletes or
 converts historical artifacts.
 
-Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. It reports requested-route (`auto` versus explicit) and terminal-Provider counts, role/Provider success rates, p50/p95 duration, fallback, partial-write, stream-retry, all-attempt usage, and accepted-success usage. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
+Use `deepseek-worker --json stats --hours 8` to see local aggregate run metadata without storing task bodies. It reports requested-route (`auto` versus explicit) and terminal-Provider counts, role/Provider success rates, p50/p95 duration, fallback, partial-write, stream-retry, bounded same-session-finalization skip reasons, all-attempt usage, and accepted-success usage. The local log is `~/.codex/deepseek-worker-runs.jsonl` with mode `0600`; its `by_run_type` section keeps external production runs separate from native canaries.
 
 For the Phase 4 rolling observation, render the same local source as a UTC daily report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.23 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.24 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
