@@ -1,6 +1,6 @@
 {
   "name": "codex-subagent-relay",
-  "version": "0.10.27",
+  "version": "0.10.28",
   "description": "Typed local MCP tools for durable third-party Codex execution jobs.",
   "author": {
     "name": "T-Markus-Liang",

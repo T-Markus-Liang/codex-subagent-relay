@@ -32,6 +32,7 @@ def task_command(
     return [
         str(executable),
         "run",
+        "--pure",
         "--dir",
         str(workdir),
         "--agent",
@@ -51,6 +52,7 @@ def finalization_command(executable: Path, workdir: Path, session_id: str, sandb
     return [
         str(executable),
         "run",
+        "--pure",
         "--dir",
         str(workdir),
         "--session",

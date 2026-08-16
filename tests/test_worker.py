@@ -92,6 +92,7 @@ class RouterTests(unittest.TestCase):
     def test_opencode_adapter_command_is_scoped_to_role_and_workdir(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             command = module.adapter_command("sensenova1", Path(temporary_dir), "repository-exploration", "read-only", "inspect only")
+        self.assertIn("--pure", command)
         self.assertEqual(command[0], str(module.OPENCODE_PATH))
         self.assertEqual(command[command.index("--dir") + 1], temporary_dir)
         self.assertEqual(command[command.index("--agent") + 1], "plan")
@@ -100,6 +101,7 @@ class RouterTests(unittest.TestCase):
     def test_finalization_command_reuses_session_and_preserves_role_sandbox(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             command = module.finalization_command(Path(temporary_dir), "session_abcdefgh", "read-only")
+        self.assertIn("--pure", command)
         self.assertEqual(command[command.index("--session") + 1], "session_abcdefgh")
         self.assertEqual(command[command.index("--agent") + 1], "plan")
         self.assertIn("Do not make any changes", command[-1])

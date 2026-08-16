@@ -31,7 +31,7 @@ from relay_runtime.routing import RuntimeConfigError, default_timeout, load_runt
 from relay_runtime.telemetry import append_record, run_record
 
 
-VERSION = "0.10.27"
+VERSION = "0.10.28"
 MAX_TASK_BYTES = 256 * 1024
 ROOT = Path(__file__).resolve().parent
 RUNTIME_CONFIG_PATH = Path(os.environ.get("DEEPSEEK_WORKER_CONFIG", str(ROOT / "relay.toml"))).expanduser()
