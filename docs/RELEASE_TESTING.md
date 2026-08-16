@@ -124,7 +124,7 @@ For the required seven-day operational observation, generate a source-local UTC 
 each day and preserve only the redacted aggregate report:
 
 ```bash
-python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.25 \
+python3.11 scripts/operational_report.py --days 7 --relay-version 0.10.26 \
   --run-type external_run --telemetry-scope production \
   --since <release-utc-timestamp> --out reports/operational-7d.json
 ```
@@ -156,6 +156,28 @@ policy is:
 If the live route misses a threshold, publish the observed failure classes and keep that route
 experimental or disabled from automatic fallback. The gate should make a bad release visible, not
 hide an upstream reliability problem.
+
+## Native Tool E2E Research Gate
+
+Native Agent Team evidence is independent from external-Relay route qualification. It is opt-in,
+uses a new temporary workspace and temporary `CODEX_HOME` on every attempt, and must not run while
+another task's native/Provider work could contaminate the evidence. For a candidate V1 parent/model
+route, run sequentially:
+
+```bash
+python3.11 scripts/native_soak.py --confirm-live --backend v1-tool \
+  --provider sensenova --parent-model gpt-5.6-sol --runs 100 \
+  --report reports/native-v1-tool-sensenova-sol-100.json
+```
+
+For the CLIProxyAPI V2 research path, use `--backend cliproxy-v2` with the same parent and run count.
+The runner preserves only fixed outcome booleans, durations, and categorized errors. A candidate is
+eligible for human promotion review only if it has at least 100 sequential samples, at least 95%
+strict success, and zero observed root-config or root-state mutation; every strict success requires
+spawn, parent wait, direct nonce-bearing result, task payload, parallel hidden-token shell evidence,
+rollout final result, Provider completion, child metadata, and isolated state. It never promotes a
+native route automatically and its metrics must not be combined with external-Relay reliability or
+Token statistics.
 
 ## Evidence Boundary
 

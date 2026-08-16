@@ -93,6 +93,14 @@ plain-language request to wait is not enough to prove parent-side result deliver
 The child must read both with parallel shell calls, return their exact values through `wait_agent`,
 and leave matching tool, rollout, bridge, and child-metadata evidence. It is still canary-only.
 
+Run `scripts/native_soak.py` only for explicit research. It creates a fresh disposable workspace for
+every native tool canary and stores only booleans, durations, fixed error categories, and aggregate
+counts; hidden values, task text, raw output, workspaces, credentials, and session identifiers are
+never written to its report. Promotion evidence needs at least 100 sequential strict E2E results,
+at least a 95% strict-success rate, and zero observed root-config or root-state mutations. A passing
+report does not switch routing or modify the compatibility manifest; native remains canary-only until
+a human reviews the evidence.
+
 ## Environment Variables
 
 | Variable | Purpose | Default |
