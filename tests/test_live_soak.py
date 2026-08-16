@@ -45,6 +45,13 @@ class LiveSoakTests(unittest.TestCase):
         self.assertEqual(module.failure_class({"status": "success"}, "write content mismatch"), "write content mismatch")
         self.assertEqual(module.failure_class({"status": "error", "stream_finish_reason": "length"}, "ok"), "stream:length")
         self.assertEqual(module.failure_class({"status": "blocked", "attempt_failure_categories": ["provider_busy"]}, "ok"), "worker:provider_busy")
+        self.assertEqual(
+            module.failure_class(
+                {"status": "blocked", "attempt_failure_categories": ["provider_busy"]},
+                "write task produced no output",
+            ),
+            "worker:provider_busy",
+        )
         self.assertIsNone(module.failure_class({"status": "success"}, "ok"))
 
     def test_consecutive_failure_stop_requires_only_recent_non_successes(self):
@@ -57,6 +64,15 @@ class LiveSoakTests(unittest.TestCase):
         )
         self.assertIsNone(module.consecutive_failure_stop([failed, succeeded, failed], 2))
         self.assertIsNone(module.consecutive_failure_stop([failed, failed], 0))
+
+    def test_provider_busy_stops_a_batch_as_inconclusive(self):
+        self.assertEqual(
+            module.consecutive_failure_stop(
+                [{"status": "blocked", "expected_output": False, "failure_class": "worker:provider_busy"}],
+                3,
+            ),
+            "provider busy; qualification batch not started",
+        )
 
     def test_opencode_idle_preflight_keeps_only_count_and_state(self):
         completed = type("Completed", (), {"returncode": 0, "stdout": "/bin/zsh\nopencode\n/opt/bin/opencode\n"})()
